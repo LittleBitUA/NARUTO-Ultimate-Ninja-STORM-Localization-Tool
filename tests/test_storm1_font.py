@@ -125,3 +125,23 @@ def test_lifted_ttf_descender_is_compensated(storm1_font_file, ttf):
     fixed = report['vertical_compensated_for_lifted_glyphs']
     assert 'р' in fixed and 'а' not in fixed
     assert table[ord('р')][6] < table[ord('а')][6] == table[ord('a')][6]
+
+
+# ---- the user's own choice of characters ----
+
+def test_only_the_chosen_characters_are_created(storm1_font_file, ttf):
+    blob, report, _ = f.build_additive_font(storm1_font_file, ttf, characters='Яя і—  «»A', with_preview=False)
+    # alphabet order for letters, then the other signs in the order they were typed; 'A' already exists
+    assert report['added_characters'] == 'ІЯія—«»'.replace('І', '') or report['added_characters'] == 'Яія—«»'
+    table = _records(blob)
+    assert all(ord(ch) in table for ch in 'Яія—«»') and ord('ю') not in table
+
+
+def test_unavailable_and_impossible_choices(storm1_font_file, ttf):
+    blob, report, _ = f.build_additive_font(storm1_font_file, ttf, characters='я☃', with_preview=False)
+    assert 'я' in report['added_characters']
+    assert '' in report['optional_chars_unavailable_in_ttf']      # not in the TTF: skipped and reported
+    with pytest.raises(f.FontError):
+        f.build_additive_font(storm1_font_file, ttf, characters='Aa1', with_preview=False)   # all exist already
+    with pytest.raises(f.FontError):
+        f.build_additive_font(storm1_font_file, ttf, characters='я\U0001F600', with_preview=False)  # beyond U+FFFF

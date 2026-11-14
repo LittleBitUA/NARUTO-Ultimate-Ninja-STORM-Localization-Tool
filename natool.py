@@ -1,46 +1,50 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""NARUTO UA Toolkit — interface for the STORM 1 / 2 / 3 localization pipelines.
+"""NARUTO UA Toolkit — application host.
 
-Only presentation and task orchestration live here; every binary format is
-handled by the backend modules next to this file.
+The interface is a web page (web/index.html, app.css, app.js) shown in its own
+window by the Chromium engine that ships with Windows (Edge). This file is the
+other half: it keeps the settings, describes the pages, starts every operation
+in a separate process (jobs.py) and serves both to the page over a local,
+token-protected HTTP connection on 127.0.0.1.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import mimetypes
 import os
-import queue
+import secrets
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox
+from urllib.parse import parse_qs, urlparse
 
 import i18n
 from i18n import T
 
-try:
-    import customtkinter as ctk
-except ImportError:                                    # pragma: no cover
-    _root = tk.Tk(); _root.withdraw()
-    messagebox.showerror('NARUTO UA Toolkit',
-                         T('Не знайдено бібліотеку інтерфейсу.\n\nЗапустіть INSTALL_DEPENDENCIES.bat і повторіть.', 'The interface library is missing.\n\nRun INSTALL_DEPENDENCIES.bat and try again.'))
-    raise SystemExit(1)
-
 import audit
 import jobs
+import steam
 import storm1_font as font1
 import storm1_text as text1
 import storm2_text as text2
 import storm3_text as text3
-from txtfmt import translation_progress
+from txtfmt import backup_project, translation_progress
 
-VERSION = '4.1.1'
+VERSION = '5.0.0'
 APP_DIR = Path(__file__).resolve().parent
+WEB_DIR = APP_DIR / 'web'
+BUNDLED_TTF = WEB_DIR / 'fonts' / 'ReggaeC-UA.ttf'      # the team's font: interface headings and default letters
+PORT = 47815                                # preferred; a free one is used if it is taken
 AUTHOR = 'Dmytro Bidlov («Little Bit» Team)'
 TELEGRAM = 't.me/LittleBitUA'
+GITHUB = 'https://github.com/LittleBitUA/NARUTO-Ultimate-Ninja-STORM-Localization-Tool'
 S1 = r'E:\SteamLibrary\steamapps\common\QWANT\data\disc\dataRegion_extracted\data'
 S2 = r'E:\SteamLibrary\steamapps\common\Qwant2\data\disc\dataRegion_extracted\data'
 LOC = r'E:\Localization\Naruto'
@@ -69,6 +73,9 @@ DEFAULT_PATHS = {
     'patch_scope_storm1': S1, 'patch_scope_storm2': S2,
     'patch_scope_report': LOC + r'\Patch_Coverage_Reports',
     'lang': '',            # '' = follow the system language
+    's1_chars': font1.UKRAINIAN_ALPHABET + '—',     # characters to create in the STORM 1 font
+    'ttf_mode_s1': '', 'ttf_mode_s2': '', 'ttf_mode_s3': '',   # 'bundled' | 'own'; '' = bundled when present
+    'page': 'home',        # last opened page
 }
 
 GAMES = {
@@ -77,23 +84,12 @@ GAMES = {
     's3': ('STORM 3', 'Full Burst + HD', 'storm3_workspace', text3.TXT),
 }
 
-# (light, dark)
-BG = ('#EEF1F6', '#0D1016')
-SIDEBAR = ('#FFFFFF', '#12151C')
-CARD = ('#FFFFFF', '#171B24')
-BORDER = ('#E1E6EE', '#242A38')
-FIELD = ('#F6F8FB', '#10131A')
-TEXT = ('#131A26', '#E9EDF4')
-MUTED = ('#667085', '#8891A4')
-ACCENT = '#F97316'
-ACCENT_HOVER = '#EA580C'
-SOFT = ('#EDF0F5', '#222837')
-SOFT_HOVER = ('#E0E5ED', '#2C3446')
-NAV_ACTIVE = ('#FFF1E6', '#2A1D12')
-TRACK = ('#E4E8EF', '#232938')
-WARN = ('#B45309', '#FBBF24')
-DISABLED = ('#98A2B3', '#6B7385')       # dimmed but still readable on every button
-FONT = 'Segoe UI'
+
+# Folders the tool creates itself: a missing one is not a mistake.
+OUTPUT_KEYS = {'workspace', 'output', 'texture_workspace', 'font_workspace', 'storm2_workspace', 'storm2_output',
+               'storm2_texture_workspace', 'storm2_font_workspace', 'storm3_workspace', 'storm3_build',
+               'storm3_output', 'storm3_font_work', 'patch_scope_report'}
+WORKSPACE_KEYS = {game[2] for game in GAMES.values()}
 
 
 def config_path() -> Path:
@@ -113,7 +109,7 @@ def saved_paths() -> dict[str, str]:
     if isinstance(content, dict):
         for key in result:
             value = content.get(key)
-            if isinstance(value, str) and (value.strip() or key == 'lang'):
+            if isinstance(value, str) and (value.strip() or DEFAULT_PATHS[key] == ''):
                 result[key] = value
     return result
 
@@ -153,309 +149,267 @@ def fmt_percent(info) -> str:
     return f'{info["percent"]:.1f}%'.replace('.', T(',', '.'))
 
 
+def fmt_time(seconds) -> str:
+    seconds = int(seconds)
+    return f'{seconds // 60}:{seconds % 60:02d}'
+
+
 def fmt_count(info) -> str:
     done, total = f'{info["done"]:,}', f'{info["total"]:,}'
     return T(f'{done} з {total} записів'.replace(',', ' '), f'{done} of {total} records')
 
 
-class App(ctk.CTk):
+
+class Ask(Exception):
+    """An action needs a yes/no answer before it can go on."""
+
+    def __init__(self, title, text, key):
+        super().__init__(text)
+        self.title, self.text, self.key = title, text, key
+
+
+class Var:
+    """A setting with the get()/set() interface the action code expects."""
+
+    def __init__(self, value, changed=None):
+        self._value, self._changed = value, changed
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        if value != self._value:
+            self._value = value
+            if self._changed:
+                self._changed()
+
+
+class Dialogs:
+    """Stands in for message boxes: questions and notices are shown by the page."""
+
+    def __init__(self):
+        self.local = threading.local()
+        self.app = None
+
+    def askyesno(self, title, text):
+        key = hashlib.sha1(text.encode('utf-8')).hexdigest()[:12]
+        if key in getattr(self.local, 'confirmed', ()):
+            return True
+        raise Ask(title, text, key)
+
+    def _notice(self, kind, title, text):
+        self.app.notify(kind, title, text)
+
+    def showerror(self, title, text):
+        self._notice('error', title, text)
+
+    def showwarning(self, title, text):
+        self._notice('warning', title, text)
+
+    def showinfo(self, title, text):
+        self._notice('info', title, text)
+
+
+messagebox = Dialogs()
+
+
+class App:
     def __init__(self):
         paths = saved_paths()
         i18n.set_language(paths['lang'])
-        ctk.set_appearance_mode('dark')
-        super().__init__(fg_color=BG)
-        self.title(f'NARUTO UA Toolkit {VERSION}')
-        self.geometry('1240x800'); self.minsize(1020, 660)
-        self.p = {key: tk.StringVar(self, value=value) for key, value in paths.items()}
-        self.flags = {name: tk.BooleanVar(self, value=value) for name, value in (
-            ('prefill', False), ('replace', False), ('s1_p', True), ('s1_y', True), ('s1_dash', True),
-            ('s1_symbols', False), ('s1_native_metrics', True), ('s2_twins', True), ('s3_twins', True))}
-        self.status = tk.StringVar(self, value=T('Готово. Оберіть гру ліворуч.', 'Ready. Pick a game on the left.'))
-        self.detail = tk.StringVar(self, value='')
-        self.events: queue.Queue = queue.Queue()
-        self._spin = False
-        self._process = None
+        self.lock = threading.RLock()
+        messagebox.app = self
+        self._current = paths.pop('page')
+        self.p = {key: Var(value, self._paths_changed) for key, value in paths.items()}
+        self.flags = {name: Var(value) for name, value in (
+            ('prefill', False), ('replace', False), ('s1_p', True), ('s1_y', True),
+            ('s1_native_metrics', True), ('s2_twins', True), ('s3_twins', True))}
+        self.status = Var(T('Готово. Оберіть місію ліворуч.', 'Ready. Pick a mission on the left.'))
+        self.detail = Var('')
+        self.dot = 'idle'                       # idle | running | good | bad
         self.working = False
-        self.controls: list = []
+        self._process = None
+        self._stopping = False
+        self._started = 0.0
+        self._running = ''
+        self.progress = None                    # None = indeterminate, else 0..1
         self.readiness: dict = {}
-        self.readiness_widgets: dict = {g: [] for g in GAMES}
-        self.previews: dict = {}
-        self._save_job = self._scan_job = None
-        self._current = 'home'
-        self._shown_previews: dict = {}
         self._scan_busy = False
-        self._build()
-        for key, var in self.p.items():
-            var.trace_add('write', self._paths_changed)
-        self.protocol('WM_DELETE_WINDOW', self._close)
-        self.after(120, self._poll)
-        self.after(300, self.refresh_readiness)
+        self._scan_again = False
+        self._previews: dict = {}               # font preview: key -> (path, version)
+        self.log_lines: list[str] = []
+        self.log_epoch = 0
+        self.notices: list[dict] = []
+        self._notice_id = 0
+        self.want_log = False
+        self.last_seen = time.monotonic()
+        self.closed = False
+        self._bad_cache = (0.0, [])
+        self.build_ui()
+        self.refresh_readiness()
 
-    # ------------------------------------------------------------------ widgets
-    def f(self, size=13, weight='normal'):
-        return ctk.CTkFont(family=FONT, size=size, weight=weight)
-
-    def label(self, parent, text='', size=13, weight='normal', color=TEXT, **kw):
-        return ctk.CTkLabel(parent, text=text, font=self.f(size, weight), text_color=color,
-                            anchor='w', justify='left', **kw)
-
-    def button(self, parent, text, command, kind='soft', width=0, lock=True):
-        styles = {'primary': dict(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color='#FFFFFF',
-                                  text_color_disabled='#FFE3CC'),
-                  'soft': dict(fg_color=SOFT, hover_color=SOFT_HOVER, text_color=TEXT,
-                               text_color_disabled=DISABLED),
-                  'ghost': dict(fg_color='transparent', hover_color=SOFT, text_color=MUTED,
-                                text_color_disabled=DISABLED, border_width=1, border_color=BORDER)}[kind]
-        btn = ctk.CTkButton(parent, text=text, command=command, height=36, corner_radius=9, width=width,
-                            font=self.f(13, 'bold' if kind == 'primary' else 'normal'), **styles)
-        if lock:
-            self.controls.append(btn)
-        return btn
-
-    def card(self, parent, title=None, hint=None):
-        outer = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
-        outer.pack(fill='x', pady=(0, 12))
-        body = ctk.CTkFrame(outer, fg_color='transparent')
-        body.pack(fill='x', padx=18, pady=14)
-        if title:
-            self.label(body, title, 15, 'bold').pack(fill='x')
-        if hint:
-            self.label(body, hint, 12, color=MUTED, wraplength=820).pack(fill='x', pady=(2, 0))
-        if title or hint:
-            ctk.CTkFrame(body, height=8, fg_color='transparent').pack()
-        return body
-
-    def path(self, parent, caption, key, kind='dir'):
-        """One labelled path field. kind: dir | xfbin | ttf | text."""
-        row = ctk.CTkFrame(parent, fg_color='transparent')
-        row.pack(fill='x', pady=3)
-        self.label(row, caption, 12, color=MUTED, width=190).pack(side='left')
-        entry = ctk.CTkEntry(row, textvariable=self.p[key], height=34, corner_radius=8, font=self.f(12),
-                             fg_color=FIELD, border_color=BORDER, border_width=1, text_color=TEXT)
-        entry.pack(side='left', fill='x', expand=True)
-        if kind != 'text':
-            self.button(row, T('Огляд', 'Overview'), lambda: self._browse(key, kind), 'ghost', width=74,
-                        lock=False).pack(side='left', padx=(8, 0))
-        return row
-
-    def actions(self, parent, items, pady=(10, 0)):
-        row = ctk.CTkFrame(parent, fg_color='transparent')
-        row.pack(fill='x', pady=pady)
-        for text, command, kind in items:
-            self.button(row, text, command, kind).pack(side='left', padx=(0, 8))
-        return row
-
-    def check(self, parent, text, flag):
-        box = ctk.CTkCheckBox(parent, text=text, variable=self.flags[flag], font=self.f(12), text_color=TEXT,
-                              fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=MUTED,
-                              checkbox_width=18, checkbox_height=18, corner_radius=5, border_width=2)
-        box.pack(anchor='w', pady=4)
-        return box
-
-    def note(self, parent, text, warn=False):
-        self.label(parent, text, 12, color=WARN if warn else MUTED, wraplength=820).pack(fill='x', pady=(8, 0))
-
-    def more(self, parent, title=None):
-        """Collapsible block for rarely changed settings."""
-        title = title or T('Шляхи та параметри', 'Paths and options')
-        holder = ctk.CTkFrame(parent, fg_color='transparent')
-        holder.pack(fill='x', pady=(10, 0))
-        body = ctk.CTkFrame(holder, fg_color='transparent')
-        toggle = ctk.CTkButton(holder, text='▸  ' + title, anchor='w', height=28, fg_color='transparent',
-                               hover_color=SOFT, text_color=MUTED, font=self.f(12), corner_radius=8)
-        toggle.pack(anchor='w')
-
-        def flip():
-            if body.winfo_manager():
-                body.pack_forget(); toggle.configure(text='▸  ' + title)
-            else:
-                body.pack(fill='x', pady=(6, 0)); toggle.configure(text='▾  ' + title)
-        toggle.configure(command=flip)
-        return body
-
-    def preview_slot(self, parent, key, title):
-        """Place where a generated font preview is shown inside the app."""
-        box = self.card(parent, title, T('Зображення зібрано з уже запакованого атласу — так гліфи бачить гра.', 'Rendered from the already packed atlas — this is what the game sees.'))
-        image = ctk.CTkLabel(box, text=T('Прев’ю з’явиться після створення шрифту.', 'The preview appears after the font is created.'), font=self.f(12),
-                             text_color=MUTED, anchor='w')
-        image.pack(fill='x')
-        self.previews[key] = image
-
-    def show_preview(self, key, path):
-        if not path or not Path(path).is_file():
-            return
-        try:
-            from PIL import Image
-            picture = Image.open(path); picture.load()
-        except Exception as exc:                       # preview is optional
-            self._log(T(f'Прев’ю не показано: {exc}', f'Preview not shown: {exc}')); return
-        width = min(860, picture.width)
-        size = (width, round(picture.height * width / picture.width))
-        self.previews[key].configure(text='', image=ctk.CTkImage(picture, picture, size=size))
-        self._shown_previews[key] = path
-
-    # ------------------------------------------------------------------- layout
-    def _build(self):
-        self.grid_columnconfigure(1, weight=1); self.grid_rowconfigure(0, weight=1)
-        side = ctk.CTkFrame(self, width=232, corner_radius=0, fg_color=SIDEBAR)
-        side.grid(row=0, column=0, sticky='nsw'); side.grid_propagate(False); side.pack_propagate(False)
-        brand = ctk.CTkFrame(side, fg_color='transparent')
-        brand.pack(fill='x', padx=20, pady=(22, 18))
-        ctk.CTkLabel(brand, text='N', width=38, height=38, corner_radius=10, fg_color=ACCENT,
-                     text_color='#FFFFFF', font=self.f(20, 'bold')).pack(side='left')
-        names = ctk.CTkFrame(brand, fg_color='transparent'); names.pack(side='left', padx=10)
-        self.label(names, 'NARUTO UA', 15, 'bold').pack(anchor='w')
-        self.label(names, T('Toolkit локалізації', 'Localization toolkit'), 11, color=MUTED).pack(anchor='w')
-
-        self.nav: dict = {}
-        self.pages: dict = {}
-        self._nav_item(side, 'home', T('Огляд', 'Overview'))
-        self.label(side, T('ІГРИ', 'GAMES'), 10, 'bold', MUTED).pack(fill='x', padx=24, pady=(16, 4))
-        for game, (name, *_rest) in GAMES.items():
-            self._nav_item(side, game, name, game)
-        self.label(side, T('ІНСТРУМЕНТИ', 'TOOLS'), 10, 'bold', MUTED).pack(fill='x', padx=24, pady=(16, 4))
-        self._nav_item(side, 'tools', T('Звірка ресурсів', 'Resource check'))
-
-        foot = ctk.CTkFrame(side, fg_color='transparent')
-        foot.pack(side='bottom', fill='x', padx=18, pady=16)
-        self.language = ctk.CTkSegmentedButton(foot, values=list(i18n.LANGUAGES.values()),
-                                               command=self._pick_language, font=self.f(12),
-                                               selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
-                                               fg_color=SOFT, unselected_color=SOFT,
-                                               unselected_hover_color=SOFT_HOVER, text_color=TEXT)
-        self.language.set(i18n.LANGUAGES[i18n.LANG])
-        self.language.pack(fill='x')
-        self.label(foot, f'v{VERSION}', 11, color=MUTED).pack(anchor='w', pady=(10, 0))
-        about = ctk.CTkFrame(side, fg_color='transparent')
-        about.pack(side='bottom', fill='x')
-        self._nav_item(about, 'about', T('Про програму', 'About'))
-
-        main = ctk.CTkFrame(self, fg_color='transparent')
-        main.grid(row=0, column=1, sticky='nsew')
-        main.grid_rowconfigure(0, weight=1); main.grid_columnconfigure(0, weight=1)
-        self.host = ctk.CTkFrame(main, fg_color='transparent')
-        self.host.grid(row=0, column=0, sticky='nsew', padx=24, pady=(20, 8))
-        self.host.grid_rowconfigure(0, weight=1); self.host.grid_columnconfigure(0, weight=1)
-
-        self.log_box = ctk.CTkTextbox(main, height=170, font=ctk.CTkFont(family='Consolas', size=12),
-                                      fg_color=CARD, border_color=BORDER, border_width=1, corner_radius=12,
-                                      text_color=TEXT, state='disabled', wrap='word')
-        bar = ctk.CTkFrame(main, fg_color=CARD, corner_radius=0, height=58)
-        bar.grid(row=2, column=0, sticky='ew'); bar.grid_propagate(False)
-        bar.grid_columnconfigure(0, weight=1)
-        self.progress = ctk.CTkProgressBar(bar, height=3, corner_radius=0, progress_color=ACCENT, fg_color=TRACK,
-                                           indeterminate_speed=4)
-        self.progress.grid(row=0, column=0, columnspan=2, sticky='ew'); self.progress.set(0)
-        info = ctk.CTkFrame(bar, fg_color='transparent')
-        info.grid(row=1, column=0, sticky='ew', padx=22, pady=(7, 0))
-        ctk.CTkLabel(info, textvariable=self.status, font=self.f(13), text_color=TEXT, anchor='w').pack(fill='x')
-        ctk.CTkLabel(info, textvariable=self.detail, font=self.f(11), text_color=MUTED, anchor='w',
-                     height=16).pack(fill='x')
-        self.log_toggle = self.button(bar, T('Журнал', 'Log'), self._toggle_log, 'ghost', width=96, lock=False)
-        self.log_toggle.grid(row=1, column=1, padx=20, pady=(8, 0))
-
+    # ---------------------------------------------------------------- page schema
+    # The pages are described once, here; the web page only draws what it is given.
+    def build_ui(self):
+        self._actions: dict = {}
+        self.pages: list = []
         self._page_home(); self._page_s1(); self._page_s2(); self._page_s3(); self._page_tools()
         self._page_about()
-        self.show(self._current)
-        for index, key in enumerate(('home', 's1', 's2', 's3', 'tools')):
-            self.bind_all(f'<Control-Key-{index + 1}>', lambda _e, k=key: self.show(k))
+        if self._current not in {page['key'] for page in self.pages}:
+            self._current = 'home'
 
-    def _nav_item(self, parent, key, text, game=None):
-        row = ctk.CTkFrame(parent, fg_color='transparent', corner_radius=10, height=42)
-        row.pack(fill='x', padx=12, pady=2); row.pack_propagate(False)
-        mark = ctk.CTkFrame(row, width=3, height=18, corner_radius=2, fg_color='transparent')
-        mark.pack(side='left', padx=(6, 9))
-        name = self.label(row, text, 13); name.pack(side='left')
-        widgets = [row, name]
-        if game:
-            badge = self.label(row, '—', 12, 'bold', MUTED); badge.pack(side='right', padx=12)
-            self.readiness_widgets[game].append(('badge', badge)); widgets.append(badge)
-        for widget in widgets:
-            widget.bind('<Button-1>', lambda _e, k=key: self.show(k))
-            widget.configure(cursor='hand2')
-        self.nav[key] = (row, mark, name)
-
-    def show(self, key):
-        self._current = key
-        for name, page in self.pages.items():
-            if name == key:
-                page.grid(row=0, column=0, sticky='nsew')
-            else:
-                page.grid_forget()
-        for name, (row, mark, text) in self.nav.items():
-            active = name == key
-            row.configure(fg_color=NAV_ACTIVE if active else 'transparent')
-            mark.configure(fg_color=ACCENT if active else 'transparent')
-            text.configure(font=self.f(13, 'bold' if active else 'normal'))
+    def _register(self, command) -> str:
+        name = f'a{len(self._actions) + 1}'
+        self._actions[name] = command
+        return name
 
     def _page(self, key, title, subtitle, game=None):
-        page = ctk.CTkFrame(self.host, fg_color='transparent')
-        self.pages[key] = page
-        head = ctk.CTkFrame(page, fg_color='transparent'); head.pack(fill='x', pady=(0, 12))
-        left = ctk.CTkFrame(head, fg_color='transparent'); left.pack(side='left', fill='x', expand=True)
-        self.label(left, title, 24, 'bold').pack(anchor='w')
-        self.label(left, subtitle, 13, color=MUTED).pack(anchor='w')
-        if game:
-            box = ctk.CTkFrame(head, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
-            box.pack(side='right')
-            inner = ctk.CTkFrame(box, fg_color='transparent'); inner.pack(padx=16, pady=10)
-            top = ctk.CTkFrame(inner, fg_color='transparent'); top.pack(fill='x')
-            self.label(top, T('Готовність перекладу', 'Translation progress'), 11, color=MUTED).pack(side='left')
-            percent = self.label(top, '—', 15, 'bold', ACCENT); percent.pack(side='right', padx=(24, 0))
-            meter = ctk.CTkProgressBar(inner, width=250, height=7, progress_color=ACCENT, fg_color=TRACK)
-            meter.set(0); meter.pack(pady=(6, 4))
-            count = self.label(inner, T('TXT ще не створено', 'No TXT yet'), 11, color=MUTED); count.pack(anchor='w')
-            self.readiness_widgets[game] += [('percent', percent), ('bar', meter), ('count', count)]
+        page = {'key': key, 'title': title, 'subtitle': subtitle, 'game': game, 'children': []}
+        self.pages.append(page)
         return page
 
     def _tabs(self, page, names):
-        view = ctk.CTkTabview(page, fg_color='transparent', corner_radius=12, border_width=0,
-                              segmented_button_fg_color=SOFT, segmented_button_selected_color=ACCENT,
-                              segmented_button_selected_hover_color=ACCENT_HOVER,
-                              segmented_button_unselected_color=SOFT,
-                              segmented_button_unselected_hover_color=SOFT_HOVER, text_color=TEXT, anchor='w')
-        view.pack(fill='both', expand=True)
-        view._segmented_button.configure(font=self.f(13))
-        frames = []
-        for name in names:
-            tab = view.add(name)
-            scroll = ctk.CTkScrollableFrame(tab, fg_color='transparent', scrollbar_button_color=SOFT,
-                                            scrollbar_button_hover_color=SOFT_HOVER)
-            scroll.pack(fill='both', expand=True)
-            frames.append(scroll)
-        return frames
+        tabs = [{'title': name, 'children': []} for name in names]
+        page['children'].append({'type': 'tabs', 'tabs': tabs})
+        return tabs
 
-    # -------------------------------------------------------------------- pages
+    def card(self, parent, title=None, hint=None):
+        node = {'type': 'card', 'title': title, 'hint': hint, 'children': []}
+        parent['children'].append(node)
+        return node
+
+    def path(self, parent, caption, key, kind='dir'):
+        parent['children'].append({'type': 'path', 'label': caption, 'key': key, 'kind': kind})
+
+    def actions(self, parent, items, pady=None):
+        parent['children'].append({'type': 'actions', 'buttons': [
+            {'label': text, 'id': self._register(command), 'kind': kind} for text, command, kind in items]})
+
+    def check(self, parent, text, flag):
+        parent['children'].append({'type': 'check', 'label': text, 'key': flag})
+
+    def note(self, parent, text, warn=False):
+        parent['children'].append({'type': 'note', 'text': text, 'warn': warn})
+
+    def more(self, parent, title=None):
+        node = {'type': 'more', 'title': title or T('Шляхи та параметри', 'Paths and options'), 'children': []}
+        parent['children'].append(node)
+        return node
+
+    def ttf(self, parent, key, mode_key):
+        """Where the letters come from: the bundled team font or the user's own TTF / OTF."""
+        parent['children'].append({
+            'type': 'ttf', 'key': key, 'mode': mode_key,
+            'label': T('Звідки брати літери', 'Where the letters come from'),
+            'bundled': T('шрифт перекладу Little Bit — уже є в програмі', 'the Little Bit translation font — already in the program'),
+            'own': T('Свій шрифт TTF / OTF', 'My own TTF / OTF font'),
+            'placeholder': T('Оберіть файл .ttf або .otf', 'Choose a .ttf or .otf file'),
+            'hint': T('Якщо ReggaeC UA у вас немає, оберіть будь-який шрифт з українськими літерами.',
+                      'If you do not have ReggaeC UA, choose any font with Ukrainian letters.')})
+
+    def chars(self, parent, key):
+        """Free choice of the characters to create, with quick-add sets."""
+        parent['children'].append({
+            'type': 'chars', 'key': key, 'label': T('Які символи створити', 'Characters to create'),
+            'count': [T('символ', 'character'), T('символи', 'characters'), T('символів', 'characters')],
+            'sets': [{'label': T('+ Українська абетка', '+ Ukrainian alphabet'), 'add': font1.UKRAINIAN_ALPHABET},
+                     {'label': T('+ Тире —', '+ Dash —'), 'add': '—'},
+                     {'label': T('+ Лапки « » „ “', '+ Quotes « » „ “'), 'add': '«»„“'},
+                     {'label': '+ № ₴ ʼ', 'add': '№₴ʼ'}],
+            'clear': T('Очистити', 'Clear'),
+            'hint': T('Впишіть будь-які символи. Створюються лише ті, яких ще немає у шрифті гри і які є у вибраному TTF. '
+                      'Знаки поза кирилицею — експериментально.',
+                      'Type any characters. Only those missing from the game font and present in the chosen TTF '
+                      'are created. Signs outside Cyrillic are experimental.')})
+
+    def ttf_mode(self, mode_key) -> str:
+        mode = self.p[mode_key].get()
+        if mode not in ('bundled', 'own'):
+            mode = 'bundled'
+        return mode if BUNDLED_TTF.is_file() or mode == 'own' else 'own'
+
+    def ttf_path(self, key, mode_key) -> str:
+        """The font file to draw letters from."""
+        return str(BUNDLED_TTF) if self.ttf_mode(mode_key) == 'bundled' else self.p[key].get().strip()
+
+    def need_ttf(self, key, mode_key) -> bool:
+        if Path(self.ttf_path(key, mode_key) or '?').is_file():
+            return True
+        messagebox.showwarning(T('Не вистачає даних', 'Missing data'),
+                               T('Оберіть шрифт TTF / OTF, з якого брати літери.', 'Choose the TTF / OTF font to take the letters from.'))
+        return False
+
+    def preview_slot(self, parent, key, title):
+        parent['children'].append({'type': 'preview', 'key': key, 'title': title,
+                                   'hint': T('Зображення зібрано з уже запакованого атласу — так гліфи бачить гра.',
+                                             'Rendered from the already packed atlas — this is what the game sees.'),
+                                   'empty': T('Прев’ю з’явиться після створення шрифту.',
+                                              'The preview appears after the font is created.')})
+
+    def show_preview(self, key, path):
+        if path and Path(path).is_file():
+            self._previews[key] = (str(path), self._previews.get(key, ('', 0))[1] + 1)
+
+    def ui(self) -> dict:
+        """Everything the page needs to draw itself in the current language."""
+        return {
+            'version': VERSION, 'lang': i18n.LANG, 'languages': i18n.LANGUAGES,
+            'games': {game: {'name': name, 'full': full} for game, (name, full, *_rest) in GAMES.items()},
+            'nav': [{'key': 'home', 'label': T('Огляд', 'Overview'), 'icon': 'scroll'},
+                    {'section': T('Місії', 'Missions')},
+                    *({'key': game, 'label': name, 'icon': f'plate{number}', 'game': game}
+                      for number, (game, (name, *_rest)) in enumerate(GAMES.items(), 1)),
+                    {'section': T('Розвідка', 'Recon')},
+                    {'key': 'tools', 'label': T('Звірка ресурсів', 'Resource check'), 'icon': 'eye'},
+                    {'key': 'about', 'label': T('Про програму', 'About'), 'icon': 'info', 'bottom': True}],
+            'pages': self.pages, 'findGames': self._find_games,
+            'strings': {
+                'brand': T('Toolkit локалізації', 'Localization toolkit'),
+                'browse': T('Огляд', 'Browse'), 'log': T('Журнал', 'Log'), 'hide': T('Сховати', 'Hide'),
+                'stop': T('Зупинити', 'Stop'), 'copy': T('Копіювати', 'Copy'), 'clear': T('Очистити', 'Clear'),
+                'copied': T('Журнал скопійовано.', 'Log copied.'), 'logTitle': T('Журнал операцій', 'Operation log'),
+                'logEmpty': T('Тут з’являться повідомлення операцій.', 'Messages from operations appear here.'),
+                'yes': T('Так', 'Yes'), 'no': T('Скасувати', 'Cancel'), 'ok': T('Гаразд', 'OK'),
+                'progress': T('Готовність перекладу', 'Translation progress'),
+                'running': T('Техніка виконується', 'Technique in progress'),
+                'open': T('До місії', 'To the mission'), 'openTxt': T('Відкрити TXT', 'Open TXT'),
+                'mission': [T('Місія перша', 'Mission one'), T('Місія друга', 'Mission two'), T('Місія третя', 'Mission three')],
+                'ready': T('Готовність', 'Progress'), 'findGames': T('Знайти ігри в Steam', 'Find the games in Steam'),
+                'author': 'Little Bit Team',
+                'paste': T('Вставити', 'Paste'), 'openFolder': T('Відкрити папку', 'Open folder'),
+                'missing': T('Такого шляху не існує', 'This path does not exist'),
+                'openImage': T('Відкрити PNG', 'Open PNG'),
+                'leave': T('Операція ще триває.', 'An operation is still running.'),
+                'offline': T('Програму закрито. Запустіть START_WINDOWS.bat знову.',
+                             'The program was closed. Start START_WINDOWS.bat again.'),
+            },
+        }
+
+    # ---------------------------------------------------------------------- pages
     def _page_home(self):
-        page = self._page('home', T('Огляд', 'Overview'), T('Стан української локалізації трьох ігор', 'Status of the Ukrainian localization of the three games'))
-        grid = ctk.CTkFrame(page, fg_color='transparent'); grid.pack(fill='x')
-        for column, (game, (name, full, *_rest)) in enumerate(GAMES.items()):
-            grid.grid_columnconfigure(column, weight=1, uniform='g')
-            card = ctk.CTkFrame(grid, fg_color=CARD, corner_radius=16, border_width=1, border_color=BORDER)
-            card.grid(row=0, column=column, sticky='nsew', padx=(0 if column == 0 else 12, 0))
-            body = ctk.CTkFrame(card, fg_color='transparent'); body.pack(fill='both', padx=20, pady=18)
-            self.label(body, name, 17, 'bold').pack(anchor='w')
-            self.label(body, full, 12, color=MUTED).pack(anchor='w')
-            percent = self.label(body, '—', 38, 'bold', ACCENT); percent.pack(anchor='w', pady=(14, 2))
-            meter = ctk.CTkProgressBar(body, height=8, progress_color=ACCENT, fg_color=TRACK)
-            meter.set(0); meter.pack(fill='x', pady=(0, 8))
-            count = self.label(body, T('TXT ще не створено', 'No TXT yet'), 12, color=MUTED); count.pack(anchor='w')
-            self.button(body, T('Відкрити', 'Open'), lambda g=game: self.show(g), 'soft', lock=False).pack(anchor='w', pady=(16, 0))
-            self.readiness_widgets[game] += [('percent', percent), ('bar', meter), ('count', count)]
-        tips = self.card(page, T('Як рахується готовність', 'How progress is counted'))
-        tips.master.pack_configure(pady=(14, 0))
-        self.note(tips, T('Відсоток — частка записів спільного TXT, де є переклад, відмінний від англійського оригіналу. Значення оновлюється після кожної операції та зміни робочої папки.', 'The percentage is the share of TXT records whose translation is present and differs from the English source. It is refreshed after every operation and whenever the workspace folder changes.'))
-        self.note(tips, T('Перед перевіркою й пакуванням програма сама відновлює порожній рядок перед «###», якщо його випадково видалили; попередня версія файлу лишається поруч як .before_autofix.bak.', 'Before verifying and packing, the tool restores the empty line before "###" if it was deleted by accident; the previous version of the file is kept next to it as .before_autofix.bak.'))
-        self.button(tips, T('Перерахувати зараз', 'Recount now'), self.refresh_readiness, 'ghost', lock=False).pack(anchor='w', pady=(12, 0))
+        page = self._page('home', T('Огляд', 'Overview'),
+                          T('Стан української локалізації трьох ігор', 'Status of the Ukrainian localization of the three games'))
+        page['children'].append({'type': 'overview'})
+        page['children'].append({
+            'type': 'steps', 'title': T('Шлях нінджя: з чого почати', 'The ninja way: where to start'),
+            'steps': [[T('Знайдіть ігри', 'Find the games'),
+                       T('Кнопка «Знайти ігри в Steam» сама заповнить шляхи.', '"Find the games in Steam" fills in the paths for you.')],
+                      [T('Розгорніть сувій', 'Unroll the scroll'),
+                       T('«Експорт TXT» — увесь текст гри в одному файлі.', '"Export TXT" — all the text of a game in one file.')],
+                      [T('Виконайте техніку', 'Perform the technique'),
+                       T('«Перевірити», потім «Зібрати» — TXT копіюється в backups.', '"Verify", then "Build" — the TXT is copied to backups.')]]})
+        self._find_games = self._register(self.detect_games)
 
     def _page_s1(self):
         page = self._page('s1', 'STORM 1', T('Тексти, Telop, текстури та шрифт першої гри', 'Text, Telop, textures and font of the first game'), 's1')
         texts, tex, font = self._tabs(page, [T('Тексти', 'Text'), T('Текстури', 'Textures'), T('Шрифт', 'Font')])
-        c = self.card(texts, T('Переклад', 'Translation'), T('Діалоги, інтерфейс і Telop в одному TXT.', 'Dialogue, interface and Telop in one TXT.'))
+        c = self.card(texts, T('Сувій перекладу', 'Translation scroll'), T('Діалоги, інтерфейс і Telop в одному TXT.', 'Dialogue, interface and Telop in one TXT.'))
         self.path(c, T('Папка перекладу', 'Translation folder'), 'workspace')
         self.actions(c, [(T('Експорт TXT', 'Export TXT'), self.s1_export, 'soft'), (T('Перевірити', 'Verify'), self.s1_verify, 'soft'),
                          (T('Зібрати й установити', 'Build and install'), self.s1_build, 'primary'),
                          (T('Відкрити TXT', 'Open TXT'), lambda: self.open_txt('s1'), 'ghost')])
+        self.actions(c, [(T('Перевірити теги', 'Check tags'), lambda: self.check_tags('s1'), 'ghost'),
+                         (T('Резервна копія TXT', 'Back up TXT'), lambda: self.backup('s1'), 'ghost')])
         m = self.more(c)
         self.path(m, T('Англійські ресурси (event\\eng)', 'English resources (event\\eng)'), 'eng')
         self.path(m, 'Telop (interface\\telop\\eng)', 'telop')
@@ -483,18 +437,17 @@ class App(ctk.CTk):
         self.actions(c, [(T('Експортувати PNG', 'Export PNG'), self.tex_one_export, 'soft'), (T('Перевірити', 'Verify'), self.tex_one_inspect, 'soft'),
                          (T('Зібрати PNG', 'Build PNG'), self.tex_one_build, 'primary')])
 
-        c = self.card(font, T('Українські літери з TTF / OTF', 'Ukrainian letters from TTF / OTF'),
-                      T('Оригінальні гліфи зберігаються; нові додаються в окремі рядки атласу з проміжками.', 'Original glyphs are kept; new ones go into separate atlas rows with gaps between cells.'))
+        c = self.card(font, T('Техніка письма', 'Lettering technique'),
+                      T('Українські літери з TTF / OTF. Оригінальні гліфи зберігаються; нові додаються в окремі рядки атласу з проміжками.', 'Ukrainian letters from a TTF / OTF. Original glyphs are kept; new ones go into separate atlas rows with gaps between cells.'))
         self.path(c, T('Оригінальний шрифт гри', 'Original game font'), 'font_source', 'xfbin')
-        self.path(c, T('Шрифт TTF / OTF', 'TTF / OTF font'), 'ttf_source', 'ttf')
+        self.ttf(c, 'ttf_source', 'ttf_mode_s1')
         self.path(c, T('Шлях у data_win32', 'Path inside data_win32'), 'font_rel', 'text')
+        self.chars(c, 's1_chars')
         self.actions(c, [(T('Створити шрифт', 'Create font'), self.s1_font_make, 'primary'),
                          (T('Відкрити прев’ю', 'Open preview'), lambda: self.open_preview('s1'), 'ghost')])
-        m = self.more(c, T('Параметри гліфів', 'Glyph options'))
+        m = self.more(c, T('Печаті техніки', 'Glyph options'))
         self.check(m, T('Мала «р» — форма оригінальної латинської p', 'Lowercase «р» — shape of the original Latin p'), 's1_p')
         self.check(m, T('Мала «у» — форма оригінальної латинської y', 'Lowercase «у» — shape of the original Latin y'), 's1_y')
-        self.check(m, T('Додати довге тире «—» (копія оригінального U+2015)', 'Add the em dash «—» (a copy of the original U+2015)'), 's1_dash')
-        self.check(m, T('Додати інші знаки: ', 'Add other signs: ') + font1.OPTIONAL_SYMBOLS.replace('—', ''), 's1_symbols')
         self.check(m, T('Метрики за найближчою латинською літерою (інакше — базові A / a)', 'Metrics from the closest Latin letter (otherwise the basic A / a)'), 's1_native_metrics')
         self.note(c, T('Після пакування атлас зчитується назад: якщо біля комірки є сторонні пікселі, шрифт не буде записано.', 'After packing, the atlas is read back: if stray pixels sit next to a cell, the font is not written.'))
         self.preview_slot(font, 's1', T('Як це виглядає у грі', 'How it looks in the game'))
@@ -506,11 +459,13 @@ class App(ctk.CTk):
     def _page_s2(self):
         page = self._page('s2', 'STORM 2', T('messageInfo, текстури та шрифт другої гри', 'messageInfo, textures and font of the second game'), 's2')
         texts, tex, font = self._tabs(page, [T('Тексти', 'Text'), T('Текстури', 'Textures'), T('Шрифт', 'Font')])
-        c = self.card(texts, T('Переклад', 'Translation'), T('Один TXT для messageInfo; збірка тестова, без установлення в гру.', 'One TXT for messageInfo; a test build, nothing is installed into the game.'))
+        c = self.card(texts, T('Сувій перекладу', 'Translation scroll'), T('Один TXT для messageInfo; збірка тестова, без установлення в гру.', 'One TXT for messageInfo; a test build, nothing is installed into the game.'))
         self.path(c, T('Папка перекладу', 'Translation folder'), 'storm2_workspace')
         self.actions(c, [(T('Експорт TXT', 'Export TXT'), self.s2_export, 'soft'), (T('Перевірити', 'Verify'), self.s2_verify, 'soft'),
                          (T('Зібрати XFBIN', 'Build XFBIN'), self.s2_build, 'primary'),
                          (T('Відкрити TXT', 'Open TXT'), lambda: self.open_txt('s2'), 'ghost')])
+        self.actions(c, [(T('Перевірити теги', 'Check tags'), lambda: self.check_tags('s2'), 'ghost'),
+                         (T('Резервна копія TXT', 'Back up TXT'), lambda: self.backup('s2'), 'ghost')])
         m = self.more(c)
         self.path(m, T('Джерело (event\\WIN64\\eng)', 'Source (event\\WIN64\\eng)'), 'storm2_eng')
         self.path(m, T('Папка Build', 'Build folder'), 'storm2_output')
@@ -526,7 +481,7 @@ class App(ctk.CTk):
 
         c = self.card(font, T('Українські літери з TTF / OTF', 'Ukrainian letters from TTF / OTF'), T('Нові гліфи — у вільних рядках атласу 512×512.', 'New glyphs go into the free rows of the 512×512 atlas.'))
         self.path(c, T('Оригінальний шрифт гри', 'Original game font'), 'storm2_font_source', 'xfbin')
-        self.path(c, T('Шрифт TTF / OTF', 'TTF / OTF font'), 'storm2_ttf_source', 'ttf')
+        self.ttf(c, 'storm2_ttf_source', 'ttf_mode_s2')
         self.path(c, T('Робоча папка шрифту', 'Font workspace folder'), 'storm2_font_workspace')
         self.path(c, T('Шлях у data_win32', 'Path inside data_win32'), 'storm2_font_rel', 'text')
         self.check(c, T('Однакові за формою літери брати з оригінального шрифту гри', 'Take identically shaped letters from the original game font'), 's2_twins')
@@ -543,13 +498,15 @@ class App(ctk.CTk):
     def _page_s3(self):
         page = self._page('s3', 'STORM 3', T('Full Burst + HD: один TXT, три окремі XFBIN', 'Full Burst + HD: one TXT, three separate XFBIN files'), 's3')
         texts, font, research = self._tabs(page, [T('Тексти', 'Text'), T('Шрифт', 'Font'), T('Аналіз', 'Analysis')])
-        c = self.card(texts, T('Переклад', 'Translation'), T('Спільний TXT збирається у Full Burst, HD WIN32 та HD WIN64.', 'The shared TXT is built for Full Burst, HD WIN32 and HD WIN64.'))
+        c = self.card(texts, T('Сувій перекладу', 'Translation scroll'), T('Спільний TXT збирається у Full Burst, HD WIN32 та HD WIN64.', 'The shared TXT is built for Full Burst, HD WIN32 and HD WIN64.'))
         self.path(c, T('Папка перекладу', 'Translation folder'), 'storm3_workspace')
         self.actions(c, [(T('Експорт TXT', 'Export TXT'), self.s3_export, 'soft'), (T('Перевірити', 'Verify'), self.s3_verify, 'soft'),
                          (T('Зібрати й установити', 'Build and install'), self.s3_build, 'primary'),
                          (T('Відкрити TXT', 'Open TXT'), lambda: self.open_txt('s3'), 'ghost')])
         self.actions(c, [(T('Відкрити Build', 'Open Build'), lambda: self.open_dir('storm3_build'), 'ghost'),
                          (T('Відкотити встановлення', 'Roll back install'), self.s3_restore, 'ghost')])
+        self.actions(c, [(T('Перевірити теги', 'Check tags'), lambda: self.check_tags('s3'), 'ghost'),
+                         (T('Резервна копія TXT', 'Back up TXT'), lambda: self.backup('s3'), 'ghost')])
         c = self.card(texts, T('Джерела', 'Sources'), T('Кожна редакція має власний формат записів — файли не взаємозамінні.', 'Each edition has its own record format — the files are not interchangeable.'))
         self.path(c, T('Папка гри', 'Game folder'), 'storm3_game')
         self.path(c, 'Full Burst · WIN32', 'storm3_eng', 'xfbin')
@@ -561,7 +518,7 @@ class App(ctk.CTk):
 
         c = self.card(font, T('Український шрифт із TTF / OTF', 'Ukrainian font from TTF / OTF'), T('66 літер додаються до оригінального NFH; атлас стає 512×512.', '66 letters are added to the original NFH; the atlas becomes 512×512.'))
         self.path(c, T('Оригінальний шрифт гри', 'Original game font'), 'storm3_font_a', 'xfbin')
-        self.path(c, T('Шрифт TTF / OTF', 'TTF / OTF font'), 'storm3_font_ttf', 'ttf')
+        self.ttf(c, 'storm3_font_ttf', 'ttf_mode_s3')
         self.path(c, T('Папка PNG і звітів', 'PNG and reports folder'), 'storm3_font_work')
         self.check(c, T('Однакові за формою літери брати з оригінального шрифту гри', 'Take identically shaped letters from the original game font'), 's3_twins')
         self.actions(c, [(T('Створити й установити', 'Create and install'), self.s3_font_make, 'primary'),
@@ -586,119 +543,183 @@ class App(ctk.CTk):
                          (T('Відкрити звіти', 'Open reports'), lambda: self.open_dir('patch_scope_report'), 'ghost')])
         self.note(c, T('Звіти TSV / JSON зберігаються поза папками ігор. Нічого не встановлюється.', 'TSV / JSON reports are saved outside the game folders. Nothing is installed.'))
 
+
     def _page_about(self):
         page = self._page('about', T('Про програму', 'About'),
                           T('Інструмент української локалізації NARUTO: Ultimate Ninja STORM 1, 2 і 3',
                             'Ukrainian localization toolkit for NARUTO: Ultimate Ninja STORM 1, 2 and 3'))
-        c = self.card(page, f'NARUTO UA Toolkit {VERSION}')
-        for caption, value in ((T('Автор', 'Author'), AUTHOR), ('Telegram', TELEGRAM)):
-            row = ctk.CTkFrame(c, fg_color='transparent'); row.pack(fill='x', pady=3)
-            self.label(row, caption, 12, color=MUTED, width=110).pack(side='left')
-            self.label(row, value, 14, 'bold').pack(side='left')
-        self.label(c, 'Made in Ukraine', 14, 'bold', ACCENT).pack(anchor='w', pady=(12, 0))
-        self.actions(c, [(TELEGRAM, lambda: webbrowser.open('https://' + TELEGRAM), 'primary')], pady=(14, 0))
-        self.controls.pop()        # the link stays clickable while a task runs
+        page['children'].append({'type': 'about', 'title': f'NARUTO UA Toolkit {VERSION}',
+                                 'rows': [[T('Автор', 'Author'), AUTHOR], ['Telegram', TELEGRAM]],
+                                 'badge': 'Made in Ukraine'})
+        c = self.card(page, T('Посилання', 'Links'))
+        self.actions(c, [(TELEGRAM, lambda: webbrowser.open('https://' + TELEGRAM), 'primary'),
+                         ('GitHub', lambda: webbrowser.open(GITHUB), 'soft'),
+                         (T('Перевірити оновлення', 'Check for updates'),
+                          lambda: webbrowser.open(GITHUB + '/releases/latest'), 'ghost')])
+        self.note(c, T('«Перевірити оновлення» відкриває сторінку останнього релізу в браузері; сама програма '
+                       'в мережу не виходить.',
+                       '"Check for updates" opens the latest release page in your browser; the program itself '
+                       'does not go online.'))
 
-    # ------------------------------------------------------------ infrastructure
-    def _browse(self, key, kind):
-        current = Path(self.p[key].get() or Path.home())
-        start = current if current.is_dir() else current.parent
-        start = str(start if start.is_dir() else Path.home())
-        if kind == 'dir':
-            picked = filedialog.askdirectory(initialdir=start)
-        elif kind == 'ttf':
-            picked = filedialog.askopenfilename(initialdir=start, filetypes=[('TTF / OTF', '*.ttf *.otf'), (T('Усі файли', 'All files'), '*.*')])
-        else:
-            picked = filedialog.askopenfilename(initialdir=start, filetypes=[('XFBIN', '*.xfbin'), (T('Усі файли', 'All files'), '*.*')])
-        if not picked:
-            return
-        self.p[key].set(picked)
-        guess = {'font_source': 'font_rel', 'storm2_font_source': 'storm2_font_rel', 'texture_source': 'texture_rel'}.get(key)
-        if guess:
-            rel = font1.relative_font_path(picked)
-            if rel:
-                self.p[guess].set(rel)
-
-    def _paths_changed(self, *_):
-        if self._save_job:
-            self.after_cancel(self._save_job)
-        self._save_job = self.after(700, self._save)
-        if self._scan_job:
-            self.after_cancel(self._scan_job)
-        self._scan_job = self.after(1500, self.refresh_readiness)
+    # ------------------------------------------------------------- infrastructure
+    def _paths_changed(self):
+        self._save()
+        self._bad_cache = (0.0, [])
+        self.refresh_readiness()
 
     def _save(self):
-        self._save_job = None
         try:
             target = config_path(); target.parent.mkdir(parents=True, exist_ok=True)
+            data = {k: v.get() for k, v in self.p.items()}
+            data['page'] = self._current
             tmp = target.with_name('settings.json.tmp')
-            tmp.write_text(json.dumps({k: v.get() for k, v in self.p.items()}, ensure_ascii=False, indent=2) + '\n',
-                           encoding='utf-8')
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
             tmp.replace(target)
         except OSError as exc:
             self._log(T('Не вдалося зберегти налаштування: ', 'Could not save settings: ') + str(exc))
 
-    def _close(self):
-        process = self._process
-        if self.working and process is not None and process.poll() is None:
-            if not messagebox.askyesno('NARUTO UA Toolkit', T(
-                    'Операція ще триває. Закрити програму й перервати її?',
-                    'An operation is still running. Close the program and stop it?')):
-                return
-            process.terminate()
-        self._save(); self.destroy()
-
-    def _pick_language(self, value):
-        code = next(k for k, name in i18n.LANGUAGES.items() if name == value)
-        if code == i18n.LANG:
-            return
-        if self.working:                               # never rebuild the window under a running task
-            self.language.set(i18n.LANGUAGES[i18n.LANG]); return
-        self.after(20, lambda: self._rebuild(code))    # let the button finish its own click first
-
-    def _rebuild(self, code):
-        """Recreate every widget in the other language; paths and state are kept."""
-        i18n.set_language(code); self.p['lang'].set(code)
-        log_text = self.log_box.get('1.0', 'end-1c')
-        log_open = bool(self.log_box.winfo_manager())
-        for child in self.winfo_children():
-            child.destroy()
-        self.controls.clear(); self.previews.clear()
-        self.readiness_widgets = {g: [] for g in GAMES}
-        self._build()
-        if log_text:
-            self.log_box.configure(state='normal'); self.log_box.insert('end', log_text + '\n')
-            self.log_box.configure(state='disabled')
-        if log_open:
-            self._toggle_log()
-        for key, path in list(self._shown_previews.items()):
-            self.show_preview(key, path)
-        self.status.set(T('Готово. Оберіть гру ліворуч.', 'Ready. Pick a game on the left.')); self.detail.set('')
-        self._paint_readiness()
+    def set_language(self, code):
+        if code in i18n.LANGUAGES and code != i18n.LANG and not self.working:
+            i18n.set_language(code); self.p['lang'].set(code)
+            self.build_ui()
+            self.status.set(T('Готово. Оберіть місію ліворуч.', 'Ready. Pick a mission on the left.')); self.detail.set('')
 
     def reset_paths(self):
-        if messagebox.askyesno(T('Стандартні шляхи', 'Default paths'), T('Повернути всі шляхи до початкових значень?', 'Reset all paths to their defaults?')):
+        if messagebox.askyesno(T('Стандартні шляхи', 'Default paths'),
+                               T('Повернути всі шляхи до початкових значень?', 'Reset all paths to their defaults?')):
             for key, value in DEFAULT_PATHS.items():
-                if key != 'lang':
+                if key in self.p and key != 'lang':
                     self.p[key].set(value)
 
-    def _toggle_log(self):
-        if self.log_box.winfo_manager():
-            self.log_box.grid_forget(); self.log_toggle.configure(text=T('Журнал', 'Log'))
-        else:
-            self.log_box.grid(row=1, column=0, sticky='ew', padx=24, pady=(0, 10))
-            self.log_toggle.configure(text=T('Сховати', 'Hide'))
+    def browse(self, key, kind):
+        """Native folder/file dialog, shown by a short helper process."""
+        current = Path(self.p[key].get() or Path.home())
+        start = current if current.is_dir() else current.parent
+        start = str(start if start.is_dir() else Path.home())
+        try:
+            done = subprocess.run([sys.executable, '-c', DIALOG, kind, start], capture_output=True, timeout=900,
+                                  creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        picked = done.stdout.decode('utf-8', 'replace').strip()
+        if not picked:
+            return
+        with self.lock:
+            self.p[key].set(picked)
+            guess = {'font_source': 'font_rel', 'storm2_font_source': 'storm2_font_rel',
+                     'texture_source': 'texture_rel'}.get(key)
+            if guess:
+                rel = font1.relative_font_path(picked)
+                if rel:
+                    self.p[guess].set(rel)
+
+    def open_folder(self, key):
+        value = self.p[key].get().strip()
+        folder = Path(value) if value else None
+        if folder is not None and not folder.is_dir():
+            folder = folder.parent
+        if folder is not None and folder.is_dir() and str(folder) not in ('', '.'):
+            open_path(folder)
+
+    def notify(self, kind, title, text):
+        with self.lock:
+            self._notice_id += 1
+            self.notices.append({'id': self._notice_id, 'kind': kind, 'title': str(title), 'text': str(text)})
+            del self.notices[:-20]
 
     def _log(self, value):
-        self.events.put(('log', str(value)))
+        with self.lock:
+            self.log_lines.extend(str(value).split('\n'))
+            if len(self.log_lines) > 6000:
+                del self.log_lines[:1000]; self.log_epoch += 1
 
+    _append_log = _log
+
+    def clear_log(self):
+        with self.lock:
+            self.log_lines.clear(); self.log_epoch += 1
+
+    def bad_paths(self) -> list:
+        """Source paths that do not exist (checked at most every two seconds)."""
+        stamp, cached = self._bad_cache
+        if time.monotonic() - stamp < 2:
+            return cached
+        bad = []
+        for page in self.pages:
+            for node in walk(page):
+                if node.get('type') == 'ttf':
+                    kind = 'ttf' if self.ttf_mode(node['mode']) == 'own' else None
+                elif node.get('type') == 'path' and node['kind'] != 'text' and node['key'] not in OUTPUT_KEYS:
+                    kind = node['kind']
+                else:
+                    kind = None
+                if kind is None:
+                    continue
+                value = self.p[node['key']].get().strip()
+                try:
+                    ok = not value or (Path(value).is_dir() if kind == 'dir' else Path(value).is_file())
+                except OSError:
+                    ok = False
+                if not ok and node['key'] not in bad:
+                    bad.append(node['key'])
+        self._bad_cache = (time.monotonic(), bad)
+        return bad
+
+    def state(self, cursor=0, epoch=-1) -> dict:
+        """What the page shows right now; called a few times per second."""
+        with self.lock:
+            self.last_seen = time.monotonic()
+            if epoch != self.log_epoch:
+                cursor = 0
+            lines = self.log_lines[cursor:]
+            notices, self.notices = self.notices, []
+            want_log, self.want_log = self.want_log, False
+            status = self.status.get()
+            if self.working:
+                status = f'{self._running}  ·  {fmt_time(time.monotonic() - self._started)}'
+            games = {}
+            for game in GAMES:
+                info = self.readiness.get(game)
+                games[game] = {'percent': info['percent'] if info and info['total'] else None,
+                               'label': fmt_percent(info),
+                               'count': fmt_count(info) if info and info['total'] else T('TXT ще не створено', 'No TXT yet'),
+                               'stamp': self._stamp(game)}
+            return {'lang': i18n.LANG, 'page': self._current, 'working': self.working, 'status': status,
+                    'detail': self.detail.get(), 'dot': self.dot, 'progress': self.progress,
+                    'paths': {k: v.get() for k, v in self.p.items()},
+                    'flags': {k: v.get() for k, v in self.flags.items()}, 'bad': self.bad_paths(),
+                    'games': games, 'previews': {k: v[1] for k, v in self._previews.items()},
+                    'bundled': BUNDLED_TTF.is_file(),
+                    'ttf': {key: self.ttf_mode(key) for key in ('ttf_mode_s1', 'ttf_mode_s2', 'ttf_mode_s3')},
+                    'log': {'epoch': self.log_epoch, 'cursor': cursor + len(lines), 'lines': lines},
+                    'notices': notices, 'wantLog': want_log}
+
+    def act(self, name, confirmed=()) -> dict:
+        """Run the action behind a button. Returns {'ask': …} when it needs a yes/no first."""
+        command = self._actions.get(name) or {'stop': self.stop, 'refresh': self.refresh_readiness}.get(name)
+        if command is None:
+            return {'error': 'unknown action'}
+        return self.act_call(command, confirmed)
+
+    def act_call(self, command, confirmed=()) -> dict:
+        messagebox.local.confirmed = set(confirmed)
+        try:
+            with self.lock:
+                command()
+        except Ask as question:
+            return {'ask': {'title': question.title, 'text': question.text, 'key': question.key}}
+        except Exception as exc:                       # never let a page action kill the host
+            self.notify('error', T('Помилка', 'Error'), f'{exc.__class__.__name__}: {exc}')
+        finally:
+            messagebox.local.confirmed = set()
+        return {'ok': True}
+
+    # ------------------------------------------------------------------- jobs
     def run(self, label, target, *args, done=None, **kwargs):
         """Start a backend operation in its own process (see jobs.py).
 
         `target` is 'module.function'; jobs.LOG / jobs.PROGRESS among the
         arguments become reporting callbacks. `done(result)` runs on success.
-        Buttons are deliberately NOT restyled while the job runs: on Windows a
-        restyled button could stay blank until the job ended.
         """
         if self.working:
             self.detail.set(T('Зачекайте: попередня операція ще триває.',
@@ -715,9 +736,22 @@ class App(ctk.CTk):
         except OSError as exc:
             messagebox.showerror(label, str(exc)); return
         self.working = True
-        self.status.set(T('Виконується: ', 'Running: ') + label); self.detail.set('')
-        self.progress.configure(mode='indeterminate'); self._spin = True
+        self._stopping = False
+        self._started = time.monotonic(); self._running = T('Техніка виконується: ', 'In progress: ') + label
+        self.status.set(self._running); self.detail.set('')
+        self.dot = 'running'; self.progress = None
         threading.Thread(target=self._pump, args=(self._process, spec, label, done), daemon=True).start()
+
+    def stop(self):
+        """Stop the running operation on request."""
+        process = self._process
+        if not self.working or process is None or process.poll() is not None:
+            return
+        if messagebox.askyesno(T('Зупинити операцію', 'Stop the operation'), T(
+                'Перервати операцію? Файли, які вже записано, залишаться; резервні копії не зачіпаються.',
+                'Stop the operation? Files that are already written stay; backups are not touched.')):
+            self._stopping = True
+            process.terminate()
 
     def _pump(self, process, spec, label, done):
         """Reader thread: forwards the job's messages. Only pipe I/O happens here."""
@@ -732,8 +766,10 @@ class App(ctk.CTk):
                     kind, payload = json.loads(line.decode('utf-8'))
                 except ValueError:
                     continue
-                if kind in ('log', 'progress'):
-                    self.events.put((kind, payload))
+                if kind == 'log':
+                    self._log(payload)
+                elif kind == 'progress':
+                    self._on_progress(payload)
                 else:
                     final = (kind, payload)
         except OSError as exc:
@@ -744,61 +780,49 @@ class App(ctk.CTk):
             final = ('error', T(f'Процес операції завершився без результату (код {code}).',
                                 f'The operation process ended without a result (code {code}).')
                      + ('\n' + '\n'.join(tail) if tail else ''))
-        self.events.put((final[0], (label, final[1], done if final[0] == 'success' else None)))
-
-    def _poll(self):
-        """Drain job events. One bad event must never stop the loop, or the
-        interface would stop noticing that operations finish."""
         try:
-            while True:
-                kind, payload = self.events.get_nowait()
-                try:
-                    self._handle(kind, payload)
-                except Exception as exc:               # keep the interface alive
-                    self._append_log(T(f'Внутрішня помилка інтерфейсу: {exc!r}', f'Internal interface error: {exc!r}'))
-        except queue.Empty:
-            pass
-        finally:
-            try:
-                if self.working and self._spin:
-                    self.progress.step()               # animated here, not by a 20 ms timer of its own
-                self.after(120, self._poll)
-            except tk.TclError:                        # window already closed
-                pass
+            self._finish(final[0], label, final[1], done)
+        except Exception as exc:                       # the host must survive a failing callback
+            self._log(T(f'Внутрішня помилка інтерфейсу: {exc!r}', f'Internal interface error: {exc!r}'))
 
-    def _append_log(self, text):
-        self.log_box.configure(state='normal'); self.log_box.insert('end', text + '\n')
-        self.log_box.see('end'); self.log_box.configure(state='disabled')
-
-    def _handle(self, kind, payload):
-        if kind == 'log':
-            self._append_log(payload)
-        elif kind == 'progress':
+    def _on_progress(self, payload):
+        try:
             current, total, text = int(payload[0]), int(payload[1]), str(payload[2])
+        except (TypeError, ValueError, IndexError):
+            return
+        with self.lock:
             if total > 0:
-                self._spin = False; self.progress.configure(mode='determinate')
-                self.progress.set(min(1.0, current / total))
+                self.progress = min(1.0, current / total)
                 text = f'{current} / {total} · {text}'
             self.detail.set(text[:160])
-        elif kind == 'readiness':
-            self._scan_busy = False
-            self.readiness = payload; self._paint_readiness()
-        else:
-            label, result, done = payload
+
+    def _finish(self, kind, label, result, done):
+        with self.lock:
             self.working = False                       # first, so nothing below can leave it stuck
             self._process = None
-            self._spin = False; self.progress.configure(mode='determinate'); self.progress.set(0)
-            self.refresh_readiness()
+            self.progress = 0.0
+            took = time.monotonic() - self._started
             if kind == 'success':
-                self.status.set(label + T(' — виконано.', ' — done.'))
-                self.detail.set(T('Подробиці — у журналі.', 'Details are in the log.'))
-                self._append_log(T(f'ГОТОВО: {label}\n{summarize(result)}', f'DONE: {label}\n{summarize(result)}'))
-                if done:
-                    done(result)
+                self.dot = 'good'
+                self.status.set(T('Місію виконано: ', 'Mission complete: ') + label)
+                self.detail.set(T(f'Тривалість {fmt_time(took)}. Подробиці — у журналі.',
+                                  f'Took {fmt_time(took)}. Details are in the log.'))
+                self._log(T(f'ГОТОВО: {label}\n{summarize(result)}', f'DONE: {label}\n{summarize(result)}'))
+            elif self._stopping:
+                self._stopping = False
+                self.dot = 'idle'
+                self.status.set(label + T(' — зупинено.', ' — stopped.')); self.detail.set('')
+                self._log(T(f'ЗУПИНЕНО: {label}', f'STOPPED: {label}'))
             else:
-                self.status.set(label + T(' — помилка.', ' — failed.')); self.detail.set('')
-                self._append_log(T(f'ПОМИЛКА: {label}\n  {result}', f'ERROR: {label}\n  {result}'))
-                messagebox.showerror(label, str(result)[:1800])
+                self.dot = 'bad'
+                self.status.set(label + T(' — помилка.', ' — failed.'))
+                self.detail.set(T('Текст помилки — у журналі.', 'The error text is in the log.'))
+                self._log(T(f'ПОМИЛКА: {label}\n  {result}', f'ERROR: {label}\n  {result}'))
+                self.notify('error', label, str(result)[:1800])
+        self.refresh_readiness()
+        if kind == 'success' and done:
+            with self.lock:
+                done(result)
 
     # ------------------------------------------------------------------ readiness
     def txt_path(self, game) -> Path:
@@ -806,28 +830,31 @@ class App(ctk.CTk):
         return Path(self.p[key].get()) / filename
 
     def refresh_readiness(self):
-        self._scan_job = None
-        if self._scan_busy:
-            return
-        self._scan_busy = True
-        targets = {game: self.txt_path(game) for game in GAMES}
+        with self.lock:
+            if self._scan_busy:
+                self._scan_again = True
+                return
+            self._scan_busy = True
+            self._scan_again = False
+            targets = {game: self.txt_path(game) for game in GAMES}
 
         def worker():
-            self.events.put(('readiness', {game: translation_progress(path) for game, path in targets.items()}))
+            result = {game: translation_progress(path) for game, path in targets.items()}
+            with self.lock:
+                self.readiness = result
+                self._scan_busy = False
+                again = self._scan_again
+            if again:
+                self.refresh_readiness()
         threading.Thread(target=worker, daemon=True).start()
 
-    def _paint_readiness(self):
-        for game, widgets in self.readiness_widgets.items():
-            info = self.readiness.get(game)
-            for kind, widget in widgets:
-                if kind in ('percent', 'badge'):
-                    widget.configure(text=fmt_percent(info))
-                elif kind == 'bar':
-                    widget.set(info['percent'] / 100 if info and info['total'] else 0)
-                elif info and info['total']:
-                    widget.configure(text=fmt_count(info))
-                else:
-                    widget.configure(text=T('TXT ще не створено', 'No TXT yet'))
+    def _stamp(self, game) -> str:
+        path = self.txt_path(game)
+        try:
+            changed = time.strftime('%d.%m.%Y %H:%M', time.localtime(path.stat().st_mtime))
+        except OSError:
+            return T('Почніть з «Експорт TXT» на сторінці гри.', 'Start with "Export TXT" on the game page.')
+        return T(f'{path.name} · змінено {changed}', f'{path.name} · changed {changed}')
 
     # -------------------------------------------------------------- common actions
     def need(self, *keys, files=False) -> bool:
@@ -843,6 +870,58 @@ class App(ctk.CTk):
         if not path.is_file():
             messagebox.showwarning(GAMES[game][0], T('TXT ще немає. Спершу виконайте «Експорт TXT».', 'There is no TXT yet. Run "Export TXT" first.')); return
         open_path(path)
+
+    def backup(self, game, quiet=False):
+        """Copy the TXT and manifest into <workspace>/backups. Quiet mode is used before a build."""
+        try:
+            result = backup_project(self.txt_path(game))
+        except OSError as exc:
+            self._log(T(f'Резервну копію не створено: {exc}', f'Backup failed: {exc}'))
+            if not quiet:
+                messagebox.showerror(GAMES[game][0], str(exc))
+            return
+        if result['created']:
+            self._log(T(f'Резервна копія TXT: {result["created"]}', f'TXT backup: {result["created"]}'))
+            if not quiet:
+                self.detail.set(T(f'Резервну копію створено: {result["created"]}',
+                                  f'Backup created: {result["created"]}'))
+        elif not quiet:
+            self.detail.set(T('TXT не змінювався від останньої копії.', 'The TXT has not changed since the last backup.')
+                            if result.get('same_as') else T('TXT ще немає.', 'There is no TXT yet.'))
+
+    def check_tags(self, game):
+        path = self.txt_path(game)
+        if not path.is_file():
+            messagebox.showwarning(GAMES[game][0], T('TXT ще немає. Спершу виконайте «Експорт TXT».', 'There is no TXT yet. Run "Export TXT" first.')); return
+        self.want_log = True                           # the list of records goes to the log
+        self.run(GAMES[game][0] + T(' · Перевірка тегів', ' · Tag check'), 'jobs.check_tags', str(path), game,
+                 log=jobs.LOG)
+
+    def detect_games(self):
+        """Find the installed games in the Steam libraries and offer to fill in the paths."""
+        try:
+            games = steam.find_games()
+        except OSError as exc:
+            messagebox.showerror('Steam', str(exc)); return
+        paths, state = steam.proposed_paths(games)
+        moved = steam.movable_outputs({k: v.get() for k, v in self.p.items()}, DEFAULT_PATHS, OUTPUT_KEYS,
+                                      Path.home() / 'Documents' / 'Naruto UA')
+        words = {'ready': T('знайдено', 'found'),
+                 'not_extracted': T('знайдено, але ресурси не розпаковано (немає dataRegion_extracted)',
+                                    'found, but its resources are not extracted (no dataRegion_extracted)'),
+                 'missing': T('не знайдено', 'not found')}
+        report = '\n'.join(f'{GAMES[game][0]}: {words[state[game]]}' for game in GAMES)
+        if not paths and not moved:
+            messagebox.showinfo('Steam', report); return
+        question = report + '\n\n' + T(f'Заповнити {len(paths) + len(moved)} шляхів автоматично?',
+                                        f'Fill in {len(paths) + len(moved)} paths automatically?')
+        if moved:
+            question += '\n' + T('Робочі папки буде перенесено до Documents\\Naruto UA, бо диска зі стандартними шляхами немає.',
+                                 'Working folders will move to Documents\\Naruto UA because the drive of the default paths does not exist.')
+        if messagebox.askyesno('Steam', question):
+            for key, value in {**moved, **paths}.items():
+                self.p[key].set(value)
+            self.status.set(T('Шляхи заповнено.', 'Paths filled in.'))
 
     def open_dir(self, key):
         path = Path(self.p[key].get())
@@ -881,6 +960,7 @@ class App(ctk.CTk):
 
     def s1_build(self):
         p = self.p
+        self.backup('s1', quiet=True)
         self.run(T('STORM 1 · Збирання й установлення', 'STORM 1 · Build and install'), 'storm1_text.build_and_install', p['eng'].get(), p['workspace'].get(), p['output'].get(), p['game'].get(), telop_dir=p['telop'].get(), log=jobs.LOG)
 
     def s1_telop(self):
@@ -888,11 +968,11 @@ class App(ctk.CTk):
         self.run(T('STORM 1 · Додавання Telop', 'STORM 1 · Add Telop'), 'storm1_text.augment_existing_telop', p['workspace'].get(), p['telop'].get(), log=jobs.LOG)
 
     def s1_font_make(self):
-        if not self.need('font_source', 'ttf_source', files=True) or not self.need('font_rel'):
+        if not self.need('font_source', files=True) or not self.need_ttf('ttf_source', 'ttf_mode_s1') or not self.need('font_rel'):
             return
         p, fl = self.p, self.flags
         native = fl['s1_native_metrics'].get()
-        self.run(T('STORM 1 · Український шрифт', 'STORM 1 · Ukrainian font'), 'storm1_font.generate_additive_font', p['font_source'].get(), p['ttf_source'].get(), p['workspace'].get(), p['output'].get(), p['font_rel'].get(), include_symbols=fl['s1_dash'].get(), include_other_symbols=fl['s1_symbols'].get(), override=True, log=jobs.LOG, latin_p_for_r=fl['s1_p'].get(), latin_y_for_u=fl['s1_y'].get(), metrics_mode='native_matched' if native else 'stable', done=self._font_done('s1'))
+        self.run(T('STORM 1 · Український шрифт', 'STORM 1 · Ukrainian font'), 'storm1_font.generate_additive_font', p['font_source'].get(), self.ttf_path('ttf_source', 'ttf_mode_s1'), p['workspace'].get(), p['output'].get(), p['font_rel'].get(), characters=p['s1_chars'].get(), override=True, log=jobs.LOG, latin_p_for_r=fl['s1_p'].get(), latin_y_for_u=fl['s1_y'].get(), metrics_mode='native_matched' if native else 'stable', done=self._font_done('s1'))
 
     def s1_font_inspect(self):
         if self.need('font_source', files=True):
@@ -959,6 +1039,8 @@ class App(ctk.CTk):
 
     def _s2_compile(self, label, dry):
         p = self.p
+        if not dry:
+            self.backup('s2', quiet=True)
         self.run(label, 'storm2_text.compile_project', p['storm2_eng'].get(), p['storm2_workspace'].get(), p['storm2_output'].get(), dry_run=dry, allow_replace=True, log=jobs.LOG)
 
     def s2_verify(self):
@@ -968,10 +1050,10 @@ class App(ctk.CTk):
         self._s2_compile(T('STORM 2 · Збирання XFBIN', 'STORM 2 · Build XFBIN'), False)
 
     def s2_font_make(self):
-        if not self.need('storm2_font_source', 'storm2_ttf_source', files=True) or not self.need('storm2_font_rel'):
+        if not self.need('storm2_font_source', files=True) or not self.need_ttf('storm2_ttf_source', 'ttf_mode_s2') or not self.need('storm2_font_rel'):
             return
         p = self.p
-        self.run(T('STORM 2 · Український шрифт', 'STORM 2 · Ukrainian font'), 'storm2_font.generate_additive_font', p['storm2_font_source'].get(), p['storm2_ttf_source'].get(), p['storm2_font_workspace'].get(), p['storm2_output'].get(), p['storm2_font_rel'].get(), override=True, log=jobs.LOG, copy_native_lookalikes=self.flags['s2_twins'].get(), done=self._font_done('s2'))
+        self.run(T('STORM 2 · Український шрифт', 'STORM 2 · Ukrainian font'), 'storm2_font.generate_additive_font', p['storm2_font_source'].get(), self.ttf_path('storm2_ttf_source', 'ttf_mode_s2'), p['storm2_font_workspace'].get(), p['storm2_output'].get(), p['storm2_font_rel'].get(), override=True, log=jobs.LOG, copy_native_lookalikes=self.flags['s2_twins'].get(), done=self._font_done('s2'))
 
     def s2_font_repair(self):
         if not self.need('storm2_font_repair_source', files=True) or not self.need('storm2_font_rel'):
@@ -1041,6 +1123,7 @@ class App(ctk.CTk):
                 T('STORM 3 · установлення', 'STORM 3 · install'), T('Зібрати три XFBIN і встановити їх у знайдені редакції гри?\n\nCPK не змінюються; попередні loose-файли зберігаються для відкату.', 'Build the three XFBIN files and install them into the detected game editions?\n\nCPK archives are not changed; previous loose files are kept for rollback.')):
             return
         p = self.p
+        self.backup('s3', quiet=True)
         self.run(T('STORM 3 · Збирання й установлення', 'STORM 3 · Build and install'), 'storm3_text.compile_project', paths, p['storm3_workspace'].get(), p['storm3_build'].get(), dry_run=False, install_root=p['storm3_game'].get(), log=jobs.LOG)
 
     def s3_restore(self):
@@ -1050,12 +1133,12 @@ class App(ctk.CTk):
                  self.p['storm3_build'].get(), self.p['storm3_game'].get(), log=jobs.LOG)
 
     def s3_font_make(self):
-        if not self.need('storm3_font_a', 'storm3_font_ttf', files=True):
+        if not self.need('storm3_font_a', files=True) or not self.need_ttf('storm3_font_ttf', 'ttf_mode_s3'):
             return
         if not messagebox.askyesno(T('STORM 3 · шрифт', 'STORM 3 · font'), T('Створити шрифт і встановити його у знайдені редакції гри?\n\nПопередні файли збережуться в Build для відкату.', 'Create the font and install it into the detected game editions?\n\nPrevious files are kept in Build for rollback.')):
             return
         p = self.p
-        self.run(T('STORM 3 · Шрифт і встановлення', 'STORM 3 · Font and install'), 'storm3_text.build_font_and_install', p['storm3_font_a'].get(), p['storm3_font_ttf'].get(), p['storm3_font_work'].get(), p['storm3_build'].get(), p['storm3_game'].get(), russian_reference=p['storm3_font_b'].get().strip() or None, copy_native_lookalikes=self.flags['s3_twins'].get(), log=jobs.LOG, done=self._font_done('s3'))
+        self.run(T('STORM 3 · Шрифт і встановлення', 'STORM 3 · Font and install'), 'storm3_text.build_font_and_install', p['storm3_font_a'].get(), self.ttf_path('storm3_font_ttf', 'ttf_mode_s3'), p['storm3_font_work'].get(), p['storm3_build'].get(), p['storm3_game'].get(), russian_reference=p['storm3_font_b'].get().strip() or None, copy_native_lookalikes=self.flags['s3_twins'].get(), log=jobs.LOG, done=self._font_done('s3'))
 
     def s3_scan(self):
         if not self.need('storm3_eng', 'storm3_output'):
@@ -1089,5 +1172,220 @@ class App(ctk.CTk):
         self.run(T('Діагностика XFBIN', 'XFBIN diagnostics'), 'audit.diagnostic_scope', a, b, c, log=jobs.LOG)
 
 
+
+def walk(node):
+    """Every node of a page description, depth first."""
+    yield node
+    for child in node.get('children', []):
+        yield from walk(child)
+    for tab in node.get('tabs', []):
+        yield from walk(tab)
+
+
+# A tiny Tk dialog run in its own process: the page cannot open native folder pickers.
+DIALOG = r'''
+import sys, tkinter as tk
+from tkinter import filedialog
+kind, start = sys.argv[1], sys.argv[2]
+root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True); root.update()
+if kind == 'dir':
+    picked = filedialog.askdirectory(initialdir=start, parent=root)
+elif kind == 'ttf':
+    picked = filedialog.askopenfilename(initialdir=start, parent=root, filetypes=[('TTF / OTF', '*.ttf *.otf'), ('*', '*.*')])
+else:
+    picked = filedialog.askopenfilename(initialdir=start, parent=root, filetypes=[('XFBIN', '*.xfbin'), ('*', '*.*')])
+sys.stdout.buffer.write((picked or '').encode('utf-8'))
+'''
+
+
+# ---- local server ------------------------------------------------------------------
+
+def make_handler(app: App, token: str):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def log_message(self, *_):                   # keep the console quiet
+            pass
+
+        def _send(self, code, body: bytes, kind='application/json; charset=utf-8'):
+            self.send_response(code)
+            self.send_header('Content-Type', kind)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, data, code=200):
+            self._send(code, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+        def _allowed(self, query) -> bool:
+            """Only this program's own page may talk to the API."""
+            host = (self.headers.get('Host') or '').split(':')[0]
+            if host not in ('127.0.0.1', 'localhost'):
+                return False
+            given = self.headers.get('X-Token') or (query.get('t') or [''])[0]
+            return secrets.compare_digest(given, token)
+
+        def do_GET(self):
+            url = urlparse(self.path)
+            query = parse_qs(url.query)
+            if url.path.startswith('/api/'):
+                if not self._allowed(query):
+                    return self._json({'error': 'forbidden'}, 403)
+                if url.path == '/api/ui':
+                    return self._json(app.ui())
+                if url.path == '/api/state':
+                    number = lambda name, default: int((query.get(name) or [default])[0])
+                    return self._json(app.state(number('log', 0), number('epoch', -1)))
+                if url.path == '/api/preview':
+                    path = app._previews.get((query.get('key') or [''])[0], ('',))[0]
+                    if path and Path(path).is_file():
+                        return self._send(200, Path(path).read_bytes(), 'image/png')
+                return self._json({'error': 'not found'}, 404)
+            name = 'index.html' if url.path in ('/', '') else url.path.lstrip('/')
+            file = (WEB_DIR / name).resolve()
+            if name == 'favicon.ico':
+                file = APP_DIR / 'natool.ico'
+            if WEB_DIR.resolve() not in file.parents and file != APP_DIR / 'natool.ico' or not file.is_file():
+                return self._send(404, b'not found', 'text/plain')
+            kind = mimetypes.guess_type(file.name)[0] or 'application/octet-stream'
+            if kind.startswith('text/') or kind.endswith('javascript'):
+                kind += '; charset=utf-8'
+            self._send(200, file.read_bytes(), kind)
+
+        def do_POST(self):
+            url = urlparse(self.path)
+            if not url.path.startswith('/api/') or not self._allowed(parse_qs(url.query)):
+                return self._json({'error': 'forbidden'}, 403)
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get('Content-Length') or 0)) or b'{}')
+            except ValueError:
+                return self._json({'error': 'bad request'}, 400)
+            reply = {'ok': True}
+            if url.path == '/api/action':
+                reply = app.act(str(body.get('id')), body.get('confirmed') or ())
+            elif url.path == '/api/set':
+                with app.lock:
+                    for key, value in (body.get('paths') or {}).items():
+                        if key in app.p and key != 'lang' and isinstance(value, str):
+                            app.p[key].set(value)
+                    for key, value in (body.get('flags') or {}).items():
+                        if key in app.flags:
+                            app.flags[key].set(bool(value))
+            elif url.path == '/api/browse':
+                if body.get('key') in app.p:
+                    app.browse(body['key'], str(body.get('kind') or 'dir'))
+            elif url.path == '/api/folder':
+                if body.get('key') in app.p:
+                    app.open_folder(body['key'])
+            elif url.path == '/api/open':
+                game = body.get('game')
+                if game in GAMES:
+                    reply = app.act_call(lambda: app.open_txt(game))
+            elif url.path == '/api/lang':
+                with app.lock:
+                    app.set_language(body.get('lang'))
+            elif url.path == '/api/page':
+                with app.lock:
+                    app._current = str(body.get('page') or 'home'); app._save()
+            elif url.path == '/api/log':
+                app.clear_log()
+            elif url.path == '/api/preview/open':
+                reply = app.act_call(lambda: app.open_preview(str(body.get('key'))))
+            elif url.path == '/api/bye':
+                app.closed = True
+            else:
+                return self._json({'error': 'not found'}, 404)
+            self._json(reply)
+
+    return Handler
+
+
+def serve(app: App, port=PORT):
+    """Start the local server; returns (server, url)."""
+    token = secrets.token_urlsafe(18)
+    handler = make_handler(app, token)
+    try:
+        server = ThreadingHTTPServer(('127.0.0.1', port), handler)
+    except OSError:
+        server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f'http://127.0.0.1:{server.server_address[1]}/?t={token}'
+
+
+# ---- window -------------------------------------------------------------------------
+
+def find_browser():
+    """A Chromium browser that can show the page in its own window (Edge is part of Windows)."""
+    candidates = []
+    if os.name == 'nt':
+        for base in (os.environ.get('ProgramFiles(x86)'), os.environ.get('ProgramFiles'), os.environ.get('LOCALAPPDATA')):
+            if base:
+                candidates += [Path(base) / 'Microsoft' / 'Edge' / 'Application' / 'msedge.exe',
+                               Path(base) / 'Google' / 'Chrome' / 'Application' / 'chrome.exe']
+    elif sys.platform == 'darwin':
+        candidates += [Path('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'),
+                       Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')]
+    else:
+        candidates += [Path(found) for name in ('microsoft-edge', 'google-chrome', 'chromium', 'chromium-browser')
+                       if (found := shutil.which(name))]
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def open_window(url):
+    """Show the page as an application window; returns the browser process or None."""
+    browser = find_browser()
+    if browser is None:
+        webbrowser.open(url)
+        return None
+    profile = config_path().parent / 'window'
+    command = [str(browser), f'--app={url}', f'--user-data-dir={profile}', '--no-first-run',
+               '--no-default-browser-check', '--disable-features=Translate,TranslateUI', '--disable-sync']
+    if not profile.exists():
+        command.append('--window-size=1280,860')       # later runs reopen where the window was left
+    try:
+        return subprocess.Popen(command)
+    except OSError:
+        webbrowser.open(url)
+        return None
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    app = App()
+    server, url = serve(app)
+    if '--serve' in argv:                              # for development: no window, print the address
+        print(url, flush=True)
+        window = None
+    else:
+        window = open_window(url)
+    opened = time.monotonic()
+    try:
+        while True:
+            time.sleep(0.4)
+            quiet = time.monotonic() - app.last_seen
+            if '--serve' in argv:
+                continue
+            if window is not None and window.poll() is None:
+                continue                               # the window is open
+            # The window is gone (or the page lives in an ordinary browser tab).
+            if app.working:
+                continue                               # let a running operation finish
+            if app.closed and quiet > 1.5:
+                break
+            if window is not None and time.monotonic() - opened > 6 and quiet > 4:
+                break
+            if quiet > 180:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with app.lock:
+            app._save()
+        server.shutdown()
+
+
 if __name__ == '__main__':
-    App().mainloop()
+    main()

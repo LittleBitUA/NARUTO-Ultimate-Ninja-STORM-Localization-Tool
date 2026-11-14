@@ -740,6 +740,7 @@ def render_ingame_preview(atlas, table: dict, Image, *, lines=PREVIEW_LINES, sca
 
 def build_additive_font(naruto_source: Path | str, ttf_path: Path | str,
                         *, include_symbols: bool=True, include_other_symbols: bool=False,
+                        characters: str | None=None,
                         with_preview: bool=True, lowercase_r_percent: int=100, latin_p_for_r: bool=False,
                         latin_y_for_u: bool=False, metrics_mode: str='stable', tracking_px: int=0) -> tuple[bytes, dict, bytes | None]:
     """Create an experimental XFBIN with appended Ukrainian glyphs, no deletions.
@@ -766,7 +767,15 @@ def build_additive_font(naruto_source: Path | str, ttf_path: Path | str,
         raise FontError(T('Профіль не збігається з перевіреним шрифтом STORM 1.', 'The profile does not match the verified STORM 1 font.'))
     codes_existing={g.codepoint for g in doc.glyphs}
     supported=_font_cmap(ttf_path,TTFont)
-    missing=[ch for ch in UKRAINIAN_ALPHABET if ord(ch) not in codes_existing]
+    # `characters` is the user's own choice of what to create. Without it the
+    # set is the whole Ukrainian alphabet plus the optional signs chosen by flags.
+    chosen=None
+    if characters is not None:
+        chosen=list(dict.fromkeys(ch for ch in characters if not ch.isspace()))
+        if any(ord(ch)>0xFFFF or 0xD800<=ord(ch)<=0xDFFF or ord(ch)<0x20 for ch in chosen):
+            raise FontError(T('Підтримуються лише звичайні символи Unicode (до U+FFFF).', 'Only ordinary Unicode characters (up to U+FFFF) are supported.'))
+    letters=UKRAINIAN_ALPHABET if chosen is None else [ch for ch in UKRAINIAN_ALPHABET if ch in chosen]
+    missing=[ch for ch in letters if ord(ch) not in codes_existing]
     unsupported=[ch for ch in missing if ord(ch) not in supported]
     if unsupported:
         raise FontError(T('Обраний TTF не містить літер: '+''.join(unsupported), 'The chosen TTF does not contain these letters: '+''.join(unsupported)))
@@ -778,15 +787,18 @@ def build_additive_font(naruto_source: Path | str, ttf_path: Path | str,
     # Em dash is enabled independently, by default. Other optional punctuation
     # is an explicit experimental opt-in: its Unicode pages (including the
     # Latin U+00xx page) would otherwise force reindexing many original glyphs.
-    wanted=[ch for ch in OPTIONAL_SYMBOLS
-            if (ch=='—' and include_symbols) or (ch!='—' and include_other_symbols)]
+    if chosen is None:
+        wanted=[ch for ch in OPTIONAL_SYMBOLS
+                if (ch=='—' and include_symbols) or (ch!='—' and include_other_symbols)]
+    else:
+        wanted=[ch for ch in chosen if ch not in UKRAINIAN_ALPHABET]
     optional=[ch for ch in wanted if ord(ch) not in codes_existing
               and (ord(ch) in supported or ch=='—')]
     unavailable_optional=[ch for ch in wanted if ord(ch) not in codes_existing
                           and ord(ch) not in supported and ch!='—']
     added=missing+optional
     if not added:
-        raise FontError(T('Немає відсутніх літер для додавання.', 'There are no missing letters to add.'))
+        raise FontError(T('Немає символів для додавання: усі вибрані вже є у шрифті гри або їх немає у TTF.', 'Nothing to add: every chosen character is already in the game font or is missing from the TTF.'))
     if len(added)>128 or any(ord(ch)>>8 != 4 for ch in missing):
         raise FontError(T('Непідтримуваний набір гліфів.', 'Unsupported glyph set.'))
     columns=doc.width//PITCH
@@ -1016,7 +1028,7 @@ def build_additive_font(naruto_source: Path | str, ttf_path: Path | str,
 
 def generate_additive_font(source, ttf,workspace,output_root,relative_path,*,
                            include_symbols=True,include_other_symbols=False,
-                           override=False,log=None,
+                           characters=None,override=False,log=None,
                            lowercase_r_percent=100, latin_p_for_r=False,
                            latin_y_for_u=False, metrics_mode='stable', tracking_px=0) -> dict:
     """Build + write to a separate data_win32 path; never replace game original."""
@@ -1033,7 +1045,7 @@ def generate_additive_font(source, ttf,workspace,output_root,relative_path,*,
         raise FontError(T('Експериментальний ZIP уже існує. Заберіть або дозвольте резервну копію.', 'The experimental ZIP already exists. Move it away or allow a backup.'))
     if log:log(T('Збирання адитивного NFH із TTF (усі японські гліфи будуть збережені)…', 'Building the additive NFH from the TTF (all Japanese glyphs will be kept)…'))
     blob,report,preview=build_additive_font(src,ttf,include_symbols=include_symbols,
-                       include_other_symbols=include_other_symbols,
+                       include_other_symbols=include_other_symbols,characters=characters,
                        lowercase_r_percent=lowercase_r_percent,
                        latin_p_for_r=latin_p_for_r,latin_y_for_u=latin_y_for_u,
                        metrics_mode=metrics_mode,tracking_px=tracking_px)

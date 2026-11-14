@@ -1,33 +1,60 @@
-"""Interface smoke tests: pages, readiness, both languages, jobs in a separate process."""
+"""The application host, driven over its local HTTP interface (no window needed)."""
 import json
 import time
-import tkinter as tk
+import urllib.error
+import urllib.request
+from pathlib import Path
 
 import pytest
-
-ctk = pytest.importorskip('customtkinter')
 
 TXT = '### 1 — a · EN: Hi\r\nПривіт\r\n\r\n###\r\n### 2 — b · EN: Bye\r\n\r\n###\r\n'
 
 
-def make_app(tmp_path, monkeypatch, lang):
-    config = tmp_path / 'config'
-    (config / 'NarutoSTORM1UATool').mkdir(parents=True, exist_ok=True)
-    (config / 'NarutoSTORM1UATool' / 'settings.json').write_text(json.dumps({'lang': lang}), encoding='utf-8')
-    monkeypatch.setenv('XDG_CONFIG_HOME', str(config))
-    monkeypatch.setenv('LOCALAPPDATA', str(config))
-    import natool
-    try:
-        return natool.App()
-    except tk.TclError:
-        pytest.skip('No display available')
+class Client:
+    def __init__(self, url):
+        self.base, self.token = url.split('/?t=')
+
+    def call(self, path, body=None, token=None, host=None):
+        request = urllib.request.Request(self.base + path, headers={'X-Token': self.token if token is None else token})
+        if host:
+            request.add_header('Host', host)
+        if body is not None:
+            request.data = json.dumps(body).encode('utf-8')
+            request.add_header('Content-Type', 'application/json')
+        with urllib.request.urlopen(request, timeout=10) as reply:
+            raw = reply.read()
+            return json.loads(raw) if reply.headers.get_content_type() == 'application/json' else raw
+
+    def state(self):
+        return self.call('/api/state?log=0&epoch=-1')
+
+    def wait(self):
+        for _ in range(600):
+            state = self.state()
+            if not state['working']:
+                return state
+            time.sleep(0.05)
+        raise AssertionError('job did not finish')
 
 
 @pytest.fixture()
-def app(tmp_path, monkeypatch):
-    window = make_app(tmp_path, monkeypatch, 'uk')
-    yield window
-    window.destroy()
+def host(tmp_path, monkeypatch):
+    def start(**settings):
+        config = tmp_path / 'config'
+        (config / 'NarutoSTORM1UATool').mkdir(parents=True, exist_ok=True)
+        (config / 'NarutoSTORM1UATool' / 'settings.json').write_text(
+            json.dumps({'lang': 'uk', **settings}), encoding='utf-8')
+        monkeypatch.setenv('XDG_CONFIG_HOME', str(config))
+        monkeypatch.setenv('LOCALAPPDATA', str(config))
+        import natool
+        app = natool.App()
+        server, url = natool.serve(app, port=0)
+        servers.append(server)
+        return app, Client(url)
+    servers = []
+    yield start
+    for server in servers:
+        server.shutdown(); server.server_close()
 
 
 def write_txt(folder):
@@ -35,102 +62,209 @@ def write_txt(folder):
     (folder / natool.text1.TXT_NAME).write_bytes(TXT.encode('utf-8-sig'))
 
 
-def shown(app, game='s1'):
-    return {kind: widget.cget('text') for kind, widget in app.readiness_widgets[game] if kind != 'bar'}
-
-
-def wait(app):
-    for _ in range(600):
-        app.update(); app._poll()
-        if not app.working:
-            return
-        time.sleep(0.02)
-    raise AssertionError('job did not finish')
-
-
-def test_pages_and_readiness(app, tmp_path):
+def button(ui, label):
+    """Action id of the button with this label."""
     import natool
-    assert set(app.pages) == {'home', 's1', 's2', 's3', 'tools', 'about'}
-    for key in app.pages:
-        app.show(key); app.update()
-    write_txt(tmp_path)
-    app.p['workspace'].set(str(tmp_path))
-    app.readiness = {'s1': natool.translation_progress(app.txt_path('s1')), 's2': None, 's3': None}
-    app._paint_readiness()
-    assert shown(app) == {'badge': '50,0%', 'percent': '50,0%', 'count': '1 з 2 записів'}
-    assert {kind for kind, _ in app.readiness_widgets['s3']} == {'badge', 'percent', 'bar', 'count'}
+    for page in ui['pages']:
+        for node in natool.walk(page):
+            for item in node.get('buttons', []):
+                if item['label'] == label:
+                    return item['id']
+    raise AssertionError(label)
 
 
-def test_language_switch_rebuilds_everything(app, tmp_path):
-    import i18n
+def test_page_description_in_both_languages(host):
     import natool
-    assert i18n.LANG == 'uk' and app.nav['home'][2].cget('text') == 'Огляд'
+    app, client = host()
+    ui = client.call('/api/ui')
+    assert [p['key'] for p in ui['pages']] == ['home', 's1', 's2', 's3', 'tools', 'about']
+    assert ui['version'] == natool.VERSION and ui['lang'] == 'uk'
+    assert [item.get('label') for item in ui['nav'] if 'key' in item][:2] == ['Огляд', 'STORM 1']
+    assert 'нінджя' in json.dumps(ui, ensure_ascii=False) and 'ніндзя' not in json.dumps(ui, ensure_ascii=False)
+    kinds = {node.get('type') for page in ui['pages'] for node in natool.walk(page)}
+    assert {'overview', 'steps', 'tabs', 'card', 'path', 'actions', 'check', 'more', 'ttf', 'chars', 'preview', 'about'} <= kinds
+    client.call('/api/lang', {'lang': 'en'})
+    english = client.call('/api/ui')
+    assert english['lang'] == 'en' and english['nav'][0]['label'] == 'Overview'
+    assert english['strings']['stop'] == 'Stop' and client.state()['status'].startswith('Ready')
+    saved = json.loads(natool.config_path().read_text(encoding='utf-8'))
+    assert saved['lang'] == 'en'
+
+
+def test_only_the_program_itself_may_use_the_api(host):
+    app, client = host()
+    for call in (lambda: client.call('/api/state', token='wrong'),
+                 lambda: client.call('/api/action', {'id': 'a1'}, token=''),
+                 lambda: client.call('/api/state', host='evil.example')):
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            call()
+        assert caught.value.code == 403
+    assert b'NARUTO UA' in client.call('/')                 # the page itself needs no token
+    assert b'@font-face' in client.call('/app.css') and client.call('/fonts/ReggaeC-UA.ttf')[:4] == b'\x00\x01\x00\x00'
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        client.call('/../natool.py')
+    assert caught.value.code == 404
+
+
+def test_readiness_paths_and_validation(host, tmp_path):
+    app, client = host()
     write_txt(tmp_path)
-    app.p['workspace'].set(str(tmp_path))
-    app.readiness = {'s1': natool.translation_progress(app.txt_path('s1')), 's2': None, 's3': None}
-    app._log('рядок журналу'); app._poll()
-    app.show('s3')
-    app._rebuild('en'); app.update()
-    assert i18n.LANG == 'en' and app.p['lang'].get() == 'en'
-    assert app.nav['home'][2].cget('text') == 'Overview' and app._current == 's3'
-    assert shown(app) == {'badge': '50.0%', 'percent': '50.0%', 'count': '1 of 2 records'}
-    assert 'рядок журналу' in app.log_box.get('1.0', 'end')
-    assert all(control.winfo_exists() for control in app.controls)
-    app._rebuild('uk'); app.update()
-    assert app.nav['home'][2].cget('text') == 'Огляд'
+    missing = str(tmp_path / 'missing.xfbin')
+    client.call('/api/set', {'paths': {'workspace': str(tmp_path), 'font_source': missing, 'lang': 'en'},
+                             'flags': {'prefill': True}})
+    for _ in range(100):
+        state = client.state()
+        if state['games']['s1']['percent'] is not None:
+            break
+        time.sleep(0.05)
+    game = state['games']['s1']
+    assert game['percent'] == 50.0 and game['label'] == '50,0%' and game['count'] == '1 з 2 записів'
+    assert 'змінено' in game['stamp'] and state['games']['s2']['percent'] is None
+    assert state['lang'] == 'uk'                               # the language is not a path
+    assert state['flags']['prefill'] is True and state['paths']['workspace'] == str(tmp_path)
+    assert 'font_source' in state['bad'] and 'workspace' not in state['bad']
+    real = tmp_path / 'font.xfbin'; real.write_bytes(b'x')
+    client.call('/api/set', {'paths': {'font_source': str(real)}})
+    assert 'font_source' not in client.state()['bad']
 
 
-def test_english_from_settings(tmp_path, monkeypatch):
-    window = make_app(tmp_path, monkeypatch, 'en')
-    try:
-        assert window.nav['about'][2].cget('text') == 'About'
-        assert ctk.get_appearance_mode() == 'Dark'
-    finally:
-        window.destroy()
+def test_font_source_choice(host, tmp_path):
+    import natool
+    app, client = host()
+    state = client.state()
+    assert state['bundled'] and state['ttf'] == {'ttf_mode_s1': 'bundled', 'ttf_mode_s2': 'bundled', 'ttf_mode_s3': 'bundled'}
+    assert app.ttf_path('ttf_source', 'ttf_mode_s1') == str(natool.BUNDLED_TTF)
+    own = tmp_path / 'mine.ttf'; own.write_bytes(b'x')
+    client.call('/api/set', {'paths': {'ttf_mode_s1': 'own', 'ttf_source': str(own)}})
+    assert client.state()['ttf']['ttf_mode_s1'] == 'own' and app.ttf_path('ttf_source', 'ttf_mode_s1') == str(own)
+    client.call('/api/set', {'paths': {'ttf_source': str(tmp_path / 'gone.ttf')}})
+    assert 'ttf_source' in client.state()['bad']
+    assert app.p['s1_chars'].get() == natool.font1.UKRAINIAN_ALPHABET + '—'
 
 
-def test_jobs_run_in_a_separate_process_and_buttons_are_never_restyled(app, monkeypatch):
-    """Buttons went blank on Windows while a job ran in a thread and every
-    button was restyled. Jobs now run in their own process and the buttons are
-    left exactly as they are."""
+def test_actions_ask_before_they_act(host, tmp_path):
+    app, client = host()
+    ui = client.call('/api/ui')
+    reply = client.call('/api/action', {'id': button(ui, 'Стандартні шляхи')})
+    assert set(reply['ask']) == {'title', 'text', 'key'}
+    client.call('/api/set', {'paths': {'workspace': str(tmp_path)}})
+    client.call('/api/action', {'id': button(ui, 'Стандартні шляхи'), 'confirmed': ['wrong']})
+    assert client.state()['paths']['workspace'] == str(tmp_path)          # not confirmed: nothing changed
+    assert client.call('/api/action', {'id': button(ui, 'Стандартні шляхи'), 'confirmed': [reply['ask']['key']]}) == {'ok': True}
+    assert client.state()['paths']['workspace'] != str(tmp_path)
+    assert client.call('/api/action', {'id': 'nope'}) == {'error': 'unknown action'}
+    notices = []
+    client.call('/api/open', {'game': 's2'})                              # no TXT yet: a warning, not a crash
+    notices += client.state()['notices']
+    assert notices and notices[0]['kind'] == 'warning'
+
+
+def test_jobs_run_in_a_separate_process(host):
     import jobs
-    import natool
-    errors = []
-    monkeypatch.setattr(natool.messagebox, 'showerror', lambda title, text: errors.append(text))
-    restyled = []
-    for control in app.controls:
-        monkeypatch.setattr(control, 'configure', lambda *a, **k: restyled.append(k))
+    app, client = host()
 
     def finish(mode, done=None):
-        app.run('test ' + mode, 'jobs.selftest', mode, done=done, log=jobs.LOG, progress=jobs.PROGRESS)
+        with app.lock:
+            app.run('test ' + mode, 'jobs.selftest', mode, done=done, log=jobs.LOG, progress=jobs.PROGRESS)
         assert app.working and app._process is not None
-        wait(app)
-        assert not app._spin and app._process is None
-        return app.log_box.get('1.0', 'end')
+        running = client.state()
+        assert running['working'] and running['dot'] == 'running' and 'test ' + mode in running['status']
+        return client.wait()
 
-    log = finish('ok')
-    assert 'selftest: ok' in log and 'ok: 1' in log and not errors
-    finish('fail')                                         # backend error
-    assert 'job failed' in errors[-1]
-    finish('crash')                                        # process dies without a result
-    assert len(errors) == 2 and '3' in errors[-1]
-    assert 'mode: print' in finish('print')                # stray print() in a backend
-    assert 'ZeroDivisionError' in finish('ok', done=lambda result: 1 / 0)
-    finish('ok', done=app._font_done('s1'))                # preview file is missing
-    finish('ok')
-    assert len(errors) == 2 and restyled == []
+    state = finish('ok')
+    assert state['dot'] == 'good' and 'Місію виконано' in state['status'] and 'Тривалість' in state['detail']
+    log = '\n'.join(state['log']['lines'])
+    assert 'selftest: ok' in log and 'ok: 1' in log and not state['notices']
+    state = finish('fail')
+    assert state['dot'] == 'bad' and state['notices'][0]['kind'] == 'error' and 'job failed' in state['notices'][0]['text']
+    state = finish('crash')                                   # the process dies without a result
+    assert state['dot'] == 'bad' and '3' in state['notices'][0]['text']
+    assert 'mode: print' in '\n'.join(finish('print')['log']['lines'])
+    state = finish('ok', done=lambda result: 1 / 0)           # a failing callback must not break the host
+    assert not state['working'] and 'ZeroDivisionError' in '\n'.join(state['log']['lines'])
+    state = finish('ok', done=app._font_done('s1'))           # preview file is missing: nothing to show
+    assert state['previews'] == {} and state['dot'] == 'good'
 
 
-def test_second_click_while_running_is_ignored(app):
-    import jobs
-    app.run('first', 'jobs.selftest', 'ok', log=jobs.LOG)
-    first = app._process
-    app.run('second', 'jobs.selftest', 'ok')
-    assert app._process is first and app.detail.get()
-    wait(app)
+def test_second_start_is_ignored_and_stop_ends_the_job(host):
+    app, client = host()
+    with app.lock:
+        app.run('long job', 'jobs.selftest', 'sleep')
+        first = app._process
+        app.run('second', 'jobs.selftest', 'ok')
+    assert app._process is first and client.state()['detail']
+    time.sleep(0.6)
+    assert '0:0' in client.state()['status']                  # the running clock
+    reply = client.call('/api/action', {'id': 'stop'})
+    client.call('/api/action', {'id': 'stop', 'confirmed': [reply['ask']['key']]})
+    state = client.wait()
+    assert 'зупинено' in state['status'] and state['dot'] == 'idle' and not state['notices']
+    assert 'ЗУПИНЕНО: long job' in '\n'.join(state['log']['lines'])
+
+
+def test_log_cursor_and_clear(host):
+    app, client = host()
+    app._log('перший'); app._log('другий\nтретій')
+    first = client.call('/api/state?log=0&epoch=-1')['log']
+    assert first['lines'] == ['перший', 'другий', 'третій'] and first['cursor'] == 3
+    assert client.call(f'/api/state?log=3&epoch={first["epoch"]}')['log']['lines'] == []
+    app._log('четвертий')
+    assert client.call(f'/api/state?log=3&epoch={first["epoch"]}')['log']['lines'] == ['четвертий']
+    client.call('/api/log', {})
+    cleared = client.call(f'/api/state?log=4&epoch={first["epoch"]}')['log']
+    assert cleared['lines'] == [] and cleared['epoch'] != first['epoch'] and cleared['cursor'] == 0
+
+
+def test_backup_tag_check_and_found_games(host, tmp_path, monkeypatch):
+    import natool
+    app, client = host()
+    ui = client.call('/api/ui')
+    write_txt(tmp_path)
+    client.call('/api/set', {'paths': {'workspace': str(tmp_path)}})
+    client.call('/api/action', {'id': button(ui, 'Резервна копія TXT')})
+    copies = list((tmp_path / 'backups').iterdir())
+    assert len(copies) == 1 and (copies[0] / natool.text1.TXT_NAME).is_file()
+    client.call('/api/action', {'id': button(ui, 'Перевірити теги')})
+    state = client.wait()
+    assert state['wantLog'] is False                          # delivered once, with the first state after the click
+    assert 'перевірено перекладених записів: 1' in '\n'.join(state['log']['lines'])
+    root = tmp_path / 'common' / 'QWANT'
+    (root / natool.steam.DATA).mkdir(parents=True)
+    monkeypatch.setattr(natool.steam, 'find_games', lambda: {'s1': root})
+    reply = client.call('/api/action', {'id': ui['findGames']})
+    assert 'STORM 1: знайдено' in reply['ask']['text'] and 'STORM 2: не знайдено' in reply['ask']['text']
+    client.call('/api/action', {'id': ui['findGames'], 'confirmed': [reply['ask']['key']]})
+    assert client.state()['paths']['game'] == str(root)
+
+
+def test_last_page_is_remembered(host):
+    import natool
+    app, client = host(page='s2')
+    assert client.state()['page'] == 's2'
+    client.call('/api/page', {'page': 's3'})
+    assert json.loads(natool.config_path().read_text(encoding='utf-8'))['page'] == 's3'
+
+
+def test_preview_is_served(host, tmp_path):
+    app, client = host()
+    picture = tmp_path / 'p.png'; picture.write_bytes(b'\x89PNG fake')
+    app._font_done('s1')({'preview': str(picture)})
+    assert client.state()['previews'] == {'s1': 1}
+    assert client.call('/api/preview?key=s1') == b'\x89PNG fake'
+    with pytest.raises(urllib.error.HTTPError):
+        client.call('/api/preview?key=s2')
 
 
 def test_summary_never_dumps_big_tables():
     import natool
     text = natool.summarize({'ok': 1, 'metrics': {str(i): list(range(40)) for i in range(50)}, 'empty': ''})
     assert 'ok: 1' in text and '50' in text and 'empty' not in text
+
+
+def test_web_files_exist_and_use_no_network():
+    web = Path(__file__).resolve().parents[1] / 'web'
+    for name in ('index.html', 'app.css', 'app.js', 'fonts/ReggaeC-UA.ttf'):
+        assert (web / name).is_file(), name
+    for name in ('index.html', 'app.css', 'app.js'):
+        text = (web / name).read_text(encoding='utf-8')
+        assert 'https://' not in text and 'http://' not in text, name      # the interface never goes online

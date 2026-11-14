@@ -49,6 +49,17 @@ def texture_inspect(source):
                      for e in textures.load_entries(source, skip_unsupported=True)[1])
 
 
+def check_tags(txt, game, log=None):
+    """All records whose <tags> differ from the English source, listed at once."""
+    import txtfmt
+    allowed, skip = {}, ()
+    if game == 's1':
+        import storm1_text
+        allowed = storm1_text.LITERAL_HEADING_TRANSLATIONS      # headings the build accepts translated
+        skip = ('MissionInfo.txt ·',)                            # the build does not compare tags there
+    return txtfmt.check_tags(txt, allowed, skip, log=log)
+
+
 def s3_restore(build, game, log=None):
     from pathlib import Path
     import storm3_text as text
@@ -70,6 +81,9 @@ def selftest(mode='ok', log=None, progress=None):
         os._exit(3)
     if mode == 'print':
         print('stray output must not break the protocol')
+    if mode == 'sleep':
+        import time
+        time.sleep(60)
     return {'ok': 1, 'mode': mode, 'preview': 'missing.png'}
 
 

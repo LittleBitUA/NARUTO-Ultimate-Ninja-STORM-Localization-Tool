@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NARUTO UA Toolkit</title>
+<link rel="icon" href="favicon.ico">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app" class="app" hidden>
+  <nav class="side" aria-label="Sections">
+    <div class="brand">
+      <svg class="brand-mark" aria-hidden="true" viewBox="0 0 48 48">
+        <circle cx="24" cy="24" r="19" fill="none" stroke="#FFF4E0" stroke-width="7" stroke-dasharray="0.1 7.36" stroke-linecap="round"/>
+        <circle cx="24" cy="24" r="19" fill="#FFF4E0"/>
+        <path d="M24 22a2 2 0 0 1 2 2a4.5 4.5 0 0 1-4.5 4.5a7 7 0 0 1-7-7a9.5 9.5 0 0 1 9.5-9.5a12 12 0 0 1 12 12" fill="none" stroke="#E8452C" stroke-width="3.2" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <div class="brand-name">NARUTO UA</div>
+        <div class="brand-sub" id="brand-sub"></div>
+      </div>
+    </div>
+    <div class="nav" id="nav"></div>
+    <div class="side-foot">
+      <div id="nav-bottom"></div>
+      <div class="lang" id="lang" role="group"></div>
+      <div class="version" id="version"></div>
+    </div>
+  </nav>
+
+  <main class="main">
+    <div class="pages" id="pages"></div>
+
+    <section class="log" id="log" hidden>
+      <div class="log-head">
+        <h2 id="log-title"></h2>
+        <button type="button" class="btn ghost small" id="log-copy"></button>
+        <button type="button" class="btn ghost small" id="log-clear"></button>
+      </div>
+      <pre class="log-body" id="log-body" tabindex="0"></pre>
+    </section>
+
+    <footer class="status">
+      <div class="progress" id="progress"><div class="progress-fill" id="progress-fill"></div></div>
+      <div class="status-row">
+        <svg class="status-mark" id="status-mark" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 1l3 8 8 3-8 3-3 8-3-8-8-3 8-3z"/><circle cx="12" cy="12" r="2" class="hole"/></svg>
+        <div class="status-text">
+          <div class="status-main" id="status-main" role="status"></div>
+          <div class="status-detail" id="status-detail"></div>
+        </div>
+        <button type="button" class="btn stop" id="stop" hidden></button>
+        <button type="button" class="btn ghost" id="log-toggle" aria-expanded="false"></button>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<div class="veil" id="veil" hidden>
+  <div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-text">
+    <h2 id="dialog-title"></h2>
+    <p id="dialog-text"></p>
+    <div class="dialog-actions" id="dialog-actions"></div>
+  </div>
+</div>
+<ul class="menu" id="menu" role="menu" hidden></ul>
+<div class="boot" id="boot">NARUTO UA Toolkit…</div>
+<script src="app.js"></script>
+</body>
+</html>

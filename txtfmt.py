@@ -171,3 +171,95 @@ def translation_progress(path: Path | str) -> dict | None:
             body.append(line)
     percent = (100.0 * done / total) if total else 0.0
     return {'done': done, 'total': total, 'percent': percent}
+
+
+# ---- backups ---------------------------------------------------------------------
+
+BACKUP_DIR = 'backups'
+
+
+def manifest_for(txt: Path) -> Path:
+    return txt.with_name(txt.name.replace('.UA.txt', '.manifest.json'))
+
+
+def backup_project(txt: Path | str, keep: int = 10) -> dict:
+    """Copy the TXT and its manifest into <workspace>/backups/<time stamp>/.
+
+    Skipped when the newest backup already holds the same TXT. Only the `keep`
+    newest backups are kept. Never raises for a missing TXT: returns
+    {'created': None} instead.
+    """
+    import time
+    txt = Path(txt)
+    if not txt.is_file():
+        return {'created': None, 'kept': 0}
+    root = txt.parent / BACKUP_DIR
+    existing = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name) if root.is_dir() else []
+    data = txt.read_bytes()
+    if existing:
+        latest = existing[-1] / txt.name
+        if latest.is_file() and latest.stat().st_size == len(data) and latest.read_bytes() == data:
+            return {'created': None, 'kept': len(existing), 'same_as': str(existing[-1])}
+    target = root / time.strftime('%Y-%m-%d_%H-%M-%S')
+    suffix = 1
+    while target.exists():
+        suffix += 1
+        target = root / (time.strftime('%Y-%m-%d_%H-%M-%S') + f'_{suffix}')
+    target.mkdir(parents=True)
+    shutil.copy2(txt, target / txt.name)
+    manifest = manifest_for(txt)
+    if manifest.is_file():
+        shutil.copy2(manifest, target / manifest.name)
+    existing.append(target)
+    for old in existing[:-keep] if keep > 0 else []:
+        shutil.rmtree(old, ignore_errors=True)
+    return {'created': str(target), 'kept': min(len(existing), keep) if keep > 0 else len(existing)}
+
+
+# ---- tag check -------------------------------------------------------------------
+
+TAG = re.compile(r'<[^<>\r\n]{1,300}>')
+
+
+def check_tags(path: Path | str, allowed: dict | None = None, skip: tuple = (), log=None, limit: int = 300) -> dict:
+    """List every record whose <tags> differ from the English source.
+
+    A build stops at the first such record; this shows all of them at once.
+    It reads only the TXT, so it is a preliminary check — the build stays the
+    final judge. `allowed` maps an original tag to an accepted localized form;
+    records whose header contains one of `skip` are not checked.
+    """
+    p = Path(path)
+    with p.open('r', encoding='utf-8-sig', errors='replace', newline=None) as fp:
+        lines = fp.read().split('\n')
+    allowed = allowed or {}
+    checked = problems = 0
+    header = None
+    body: list[str] = []
+    for line in lines:
+        if line == '###':
+            if header is not None:
+                while body and body[-1] == '':
+                    body.pop()
+                text = '\n'.join(x[1:] if x.startswith(('\\#', '\\\\')) else x for x in body)
+                source = header.partition(' · EN: ')[2]
+                if text.strip() and not any(mark in header for mark in skip):
+                    checked += 1
+                    expected = TAG.findall(source)
+                    found = TAG.findall(text)
+                    if found != expected and found != [allowed.get(tag, tag) for tag in expected]:
+                        problems += 1
+                        if log and problems <= limit:
+                            number = header[4:].partition(' ')[0]
+                            log(T(f'  запис {number}: в оригіналі {" ".join(expected) or "—"}  →  у перекладі {" ".join(found) or "—"}',
+                                  f'  record {number}: original {" ".join(expected) or "—"}  →  translation {" ".join(found) or "—"}'))
+            header = None; body = []
+        elif header is None:
+            if line.startswith('### '):
+                header = line; body = []
+        else:
+            body.append(line)
+    if log and problems > limit:
+        log(T(f'  … і ще {problems - limit}.', f'  … and {problems - limit} more.'))
+    return {T('перевірено перекладених записів', 'translated records checked'): checked,
+            T('записів із відмінними тегами', 'records with different tags'): problems}

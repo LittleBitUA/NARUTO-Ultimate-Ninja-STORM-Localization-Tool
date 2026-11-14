@@ -7,13 +7,15 @@
 Translate the text, redraw the textures and extend the fonts of STORM 1, STORM 2 and STORM 3 —
 from one window, without touching the original game files.
 
-![Version](https://img.shields.io/badge/version-4.1.1-F97316?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-5.0.0-FF7B00?style=for-the-badge)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge)
 ![Made in Ukraine](https://img.shields.io/badge/made%20in-Ukraine-FFD700?style=for-the-badge&labelColor=0057B7)
 
 [**Download**](https://github.com/LittleBitUA/NARUTO-Ultimate-Ninja-STORM-Localization-Tool/releases/latest) · [Українською](README_UA.md) · [Changelog](CHANGELOG.md) · [Telegram](https://t.me/LittleBitUA)
+
+![Overview page: three mission scrolls with translation progress](docs/overview.png)
 
 </div>
 
@@ -29,7 +31,7 @@ files a translator can actually edit, and packs the edited files back.
 | --- | --- |
 | 📝 **Text** | Every string of a game in **one TXT file** — dialogue, menus, item names, mission text, subtitles. |
 | 🖼️ **Textures** | Interface and story-title images exported to **PNG** and rebuilt after editing. |
-| 🔤 **Fonts** | Missing letters are **added** to the game font from any TTF / OTF; the original glyphs stay. |
+| 🔤 **Fonts** | Missing letters are **added** to the game font; the original glyphs stay. |
 | 📊 **Progress** | A live completion percentage for each game. |
 | 🛡️ **Safety** | Originals are only ever read. Every install makes backups, and STORM 3 has one-click rollback. |
 | 🌐 **Two languages** | The interface is in English and Ukrainian and follows the Windows display language. |
@@ -50,11 +52,14 @@ files a translator can actually edit, and packs the edited files back.
 
 1. Install **Python 3.10 or newer** on Windows.
 2. Download the [latest release](https://github.com/LittleBitUA/NARUTO-Ultimate-Ninja-STORM-Localization-Tool/releases/latest) and unpack it anywhere.
-3. Run **`INSTALL_DEPENDENCIES.bat`** once — it installs `customtkinter`, `Pillow` and `fonttools`.
+3. Run **`INSTALL_DEPENDENCIES.bat`** once — it installs `Pillow` and `fonttools`.
 4. Start the tool with **`START_WINDOWS.bat`**.
-5. Pick a game in the sidebar, point the tool at your game and workspace folders, and press **Export TXT**.
+5. On the Overview page press **Find the games in Steam** — the tool locates the installed games and
+   fills in the paths. You can also set the folders by hand.
+6. Open a mission and press **Export TXT**.
 
-The interface language follows Windows (Ukrainian or English); you can switch it at the bottom of the sidebar.
+The tool opens in its own window, drawn by Microsoft Edge (part of Windows 10 and 11). Without Edge or
+Chrome it opens as a tab in your browser. It works offline and talks only to itself on `127.0.0.1`.
 
 ## 📝 Translating text
 
@@ -73,18 +78,19 @@ Each game gets a single file in your workspace folder — `STORM1.ALL.UA.txt`, `
 - Don't change headers or their order, and don't edit the manifest.
 - A line that starts with `#` or `\` is written as `\#` or `\\`.
 
-Then use the three buttons:
-
 | Button | What happens |
 | --- | --- |
 | **Export TXT** | Creates the TXT from the game. Running it again carries your translations over and keeps a backup. |
 | **Verify** | Checks the whole TXT against the game files. Writes nothing. |
 | **Build** | Packs the TXT into `XFBIN` (and installs it, for STORM 1 and STORM 3). |
+| **Check tags** | Lists every record whose `<tags>` differ from the original — a build stops at the first one. |
+| **Back up TXT** | Copies the TXT and manifest into `backups` inside the workspace. |
 
 **Small things that save time**
 
 - Speaker names in STORM 1 are translated **once** and inserted everywhere they appear.
 - STORM 3 text is shared: one TXT produces separate files for Full Burst, HD WIN32 and HD WIN64.
+- The TXT is backed up automatically before every build; the last 10 copies are kept.
 - If the empty line before a closing `###` gets deleted by accident, the tool restores it before
   packing and keeps the previous file as `*.before_autofix.bak`.
 
@@ -99,18 +105,27 @@ in any editor — keep its size and alpha channel — and press **Build changed 
 
 ## 🔤 Fonts
 
-The games ship without Cyrillic. The toolkit renders the missing letters from a TTF / OTF of your
-choice and appends them to the game font — the original glyphs and their metrics are left alone.
+The games ship without Cyrillic. The toolkit draws the missing letters and appends them to the game
+font — the original glyphs and their metrics are left alone.
+
+<div align="center">
+
+![Font tab: bundled font or your own TTF, and the characters to create](docs/font.png)
+
+</div>
+
+- **Where the letters come from.** The bundled **ReggaeC UA** font — a Cyrillic version of the
+  typeface used in the games' own menus — or any TTF / OTF of your own.
+- **Which characters to create** (STORM 1). Type any set, or add the Ukrainian alphabet, the dash,
+  quotes and other signs with one click. Only characters missing from the game font are created.
+- **A preview of the result** (STORM 1). Sample text is drawn from the already packed atlas, each
+  glyph placed by its own record — the way the game will show it.
 
 | Game | How the letters are added |
 | --- | --- |
 | **STORM 1** | New rows are appended to the atlas. Every new cell gets a 4 px empty margin, and the packed atlas is read back to prove nothing bleeds into a neighbouring glyph. |
 | **STORM 2** | Letters go into the unused rows of the 512×512 atlas. A separate action repairs fonts built by older versions. |
 | **STORM 3** | 66 letters are added and the atlas grows from 512×256 to 512×512; the font is installed with backups. |
-
-For STORM 1 the tool also shows **how the result will look in the game**: sample text is drawn from
-the already packed atlas, each glyph placed by its own record. Letters that look the same in Latin and
-Cyrillic can be copied from the game's own font, so they match the original style exactly.
 
 ## 🛡️ Safety
 
@@ -119,7 +134,9 @@ Cyrillic can be copied from the game's own font, so they match the original styl
 - Inputs are checked against the SHA-256 recorded at export time — a build refuses to run against
   the wrong version of a file.
 - Rebuilt files are parsed again and checked before they are written.
-- Long operations run in a separate process, so the window stays responsive.
+- Every operation runs in a separate process and can be stopped with the **Stop** button; files that
+  are already written stay as they are.
+- Source paths that do not exist are outlined in red before you start anything.
 
 ## ⚠️ Status
 
@@ -130,19 +147,22 @@ This is a working tool made for a real translation project, not a finished produ
 - Loading the STORM 3 text through loose files in the **HD edition** is not yet confirmed in game.
 - The enlarged STORM 3 font atlas (512×512) is not yet confirmed by the engine.
 - Textures with mip levels, and formats other than BC1 / BC3, are not rebuilt.
+- The free choice of characters works for the STORM 1 font; STORM 2 and 3 add the Ukrainian alphabet.
 - Notes inside the generated reports and the comment lines at the top of the TXT are in Ukrainian.
 
 ## 🗂️ Project layout
 
 | File | Role |
 | --- | --- |
-| `natool.py` | The interface |
+| `natool.py` | The application: settings, page descriptions, local server, window |
+| `web/` | The interface itself: `index.html`, `app.css`, `app.js` and the ReggaeC UA font |
 | `jobs.py` | Runs each operation in its own process |
 | `i18n.py` | Interface language (English / Ukrainian) |
-| `txtfmt.py` | The TXT format, automatic repair, progress counting |
+| `txtfmt.py` | The TXT format, automatic repair, progress, backups, tag check |
 | `storm1_text.py` · `storm2_text.py` · `storm3_text.py` | Text: export, build, install |
 | `storm1_font.py` · `storm2_font.py` · `storm3_font.py` | Fonts |
 | `textures.py` | Textures: PNG ⇄ XFBIN |
+| `steam.py` | Finds the installed games in the Steam libraries |
 | `audit.py` | Read-only reports about game resources |
 | `xfbin.py` | Reader for the NUCC / XFBIN container |
 
@@ -172,7 +192,7 @@ game resources are skipped until you point them at your own files through enviro
 
 ## 📄 License
 
-Released under the [MIT License](LICENSE).
+The code is released under the [MIT License](LICENSE).
 
 ---
 
