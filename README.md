@@ -10,9 +10,10 @@ from one window, without touching the original game files.
 ![Version](https://img.shields.io/badge/version-4.1.1-F97316?style=for-the-badge)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge)
 ![Made in Ukraine](https://img.shields.io/badge/made%20in-Ukraine-FFD700?style=for-the-badge&labelColor=0057B7)
 
-[Українською](README_UA.md) · [Changelog](CHANGELOG.md) · [Telegram](https://t.me/LittleBitUA)
+[**Download**](https://github.com/LittleBitUA/NARUTO-Ultimate-Ninja-STORM-Localization-Tool/releases/latest) · [Українською](README_UA.md) · [Changelog](CHANGELOG.md) · [Telegram](https://t.me/LittleBitUA)
 
 </div>
 
@@ -48,7 +49,7 @@ files a translator can actually edit, and packs the edited files back.
 ## 🚀 Quick start
 
 1. Install **Python 3.10 or newer** on Windows.
-2. Download this repository and unpack it anywhere.
+2. Download the [latest release](https://github.com/LittleBitUA/NARUTO-Ultimate-Ninja-STORM-Localization-Tool/releases/latest) and unpack it anywhere.
 3. Run **`INSTALL_DEPENDENCIES.bat`** once — it installs `customtkinter`, `Pillow` and `fonttools`.
 4. Start the tool with **`START_WINDOWS.bat`**.
 5. Pick a game in the sidebar, point the tool at your game and workspace folders, and press **Export TXT**.
@@ -168,6 +169,10 @@ game resources are skipped until you point them at your own files through enviro
 [![Telegram](https://img.shields.io/badge/Telegram-LittleBitUA-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/LittleBitUA)
 
 </div>
+
+## 📄 License
+
+Released under the [MIT License](LICENSE).
 
 ---
 

@@ -1,6 +1,6 @@
 # NARUTO UA Toolkit 4.1
 
-*English: [README.md](README.md)*
+*English: [README.md](README.md)* · [Завантажити останній реліз](https://github.com/LittleBitUA/NARUTO-Ultimate-Ninja-STORM-Localization-Tool/releases/latest)
 
 Інструмент української локалізації NARUTO: Ultimate Ninja STORM 1, STORM 2 та STORM 3 (Full Burst + HD):
 тексти, текстури й шрифти.
@@ -97,3 +97,7 @@ py -3 -m pytest tests
 ## Автор
 
 Dmytro Bidlov («Little Bit» Team) · Made in Ukraine · [t.me/LittleBitUA](https://t.me/LittleBitUA)
+
+## Ліцензія
+
+[MIT](LICENSE).
