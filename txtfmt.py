@@ -40,6 +40,39 @@ def escape_header_source(s: str) -> str:
     return s.replace('\r\n', '\\r\\n').replace('\r', '\\r').replace('\n', '\\n')
 
 
+LINE_BREAK = re.compile(r'\r\n|\r|\n|\\r\\n|\\n|\\r')
+
+
+def fit_line_breaks(translation: str, source: str) -> str:
+    """Write the line breaks of a translation the way the original writes them.
+
+    The TXT shows a physical break as a new line, text editors turn CRLF into
+    LF, and translators also type \n by hand because the header shows breaks
+    that way. All of these mean "a line break here", so each one is rewritten
+    in the form the game string itself uses: \r\n, \n or \r as real characters,
+    or the same written out with backslashes.
+
+    With as many breaks as the original, every break takes the form of its
+    counterpart. With a different number, each takes the original's usual form.
+    A string whose original has no breaks is left as typed.
+    """
+    wanted = LINE_BREAK.findall(source)
+    if not wanted or not LINE_BREAK.search(translation):
+        return translation
+    found = LINE_BREAK.findall(translation)
+    if len(found) == len(wanted):
+        forms = iter(wanted)
+        return LINE_BREAK.sub(lambda m: next(forms), translation)
+
+    def usual(written: bool) -> str | None:
+        same = [x for x in wanted if x.startswith('\\') == written]
+        return max(set(same), key=same.count) if same else None
+
+    real, written = usual(False), usual(True)
+    return LINE_BREAK.sub(
+        lambda m: (written or real) if m.group().startswith('\\') else (real or written), translation)
+
+
 def export_line(text: str) -> list[str]:
     # One logical line per physical line; leading # and \ are escaped so they
     # cannot collide with ### or #! directives.
@@ -160,7 +193,7 @@ def translation_progress(path: Path | str) -> dict | None:
                 while body and body[-1] == '':
                     body.pop()
                 text = '\\n'.join(x[1:] if x.startswith(('\\#', '\\\\')) else x for x in body)
-                if text.strip() and text != source:
+                if text.strip() and LINE_BREAK.sub('\n', text) != LINE_BREAK.sub('\n', source):
                     done += 1
             source = None; body = []
         elif source is None:

@@ -35,13 +35,14 @@ import storm1_font as font1
 import storm1_text as text1
 import storm2_text as text2
 import storm3_text as text3
-from txtfmt import backup_project, translation_progress
+from txtfmt import atomic_write, backup_project, translation_progress
 
-VERSION = '5.0.0'
+VERSION = '5.0.1'
 APP_DIR = Path(__file__).resolve().parent
 WEB_DIR = APP_DIR / 'web'
 BUNDLED_TTF = WEB_DIR / 'fonts' / 'ReggaeC-UA.ttf'      # the team's font: interface headings and default letters
 PORT = 47815                                # preferred; a free one is used if it is taken
+WINDOW_SIZE = (1360, 880)                   # the window always opens at this size; the pages are laid out for it
 AUTHOR = 'Dmytro Bidlov («Little Bit» Team)'
 TELEGRAM = 't.me/LittleBitUA'
 GITHUB = 'https://github.com/LittleBitUA/NARUTO-Ultimate-Ninja-STORM-Localization-Tool'
@@ -273,8 +274,9 @@ class App:
         page['children'].append({'type': 'tabs', 'tabs': tabs})
         return tabs
 
-    def card(self, parent, title=None, hint=None):
-        node = {'type': 'card', 'title': title, 'hint': hint, 'children': []}
+    def card(self, parent, title=None, hint=None, col=1):
+        """A titled group. Inside a tab, `col=2` puts it into the right-hand column."""
+        node = {'type': 'card', 'title': title, 'hint': hint, 'col': col, 'children': []}
         parent['children'].append(node)
         return node
 
@@ -312,15 +314,16 @@ class App:
         parent['children'].append({
             'type': 'chars', 'key': key, 'label': T('Які символи створити', 'Characters to create'),
             'count': [T('символ', 'character'), T('символи', 'characters'), T('символів', 'characters')],
-            'sets': [{'label': T('+ Українська абетка', '+ Ukrainian alphabet'), 'add': font1.UKRAINIAN_ALPHABET},
+            'sets': [{'label': T('+ Абетка', '+ Alphabet'), 'add': font1.UKRAINIAN_ALPHABET,
+                      'title': T('Додати українську абетку', 'Add the Ukrainian alphabet')},
                      {'label': T('+ Тире —', '+ Dash —'), 'add': '—'},
                      {'label': T('+ Лапки « » „ “', '+ Quotes « » „ “'), 'add': '«»„“'},
                      {'label': '+ № ₴ ʼ', 'add': '№₴ʼ'}],
             'clear': T('Очистити', 'Clear'),
-            'hint': T('Впишіть будь-які символи. Створюються лише ті, яких ще немає у шрифті гри і які є у вибраному TTF. '
+            'hint': T('Створюються лише символи, яких ще немає у шрифті гри і які є у вибраному TTF. '
                       'Знаки поза кирилицею — експериментально.',
-                      'Type any characters. Only those missing from the game font and present in the chosen TTF '
-                      'are created. Signs outside Cyrillic are experimental.')})
+                      'Only characters missing from the game font and present in the chosen TTF are created. '
+                      'Signs outside Cyrillic are experimental.')})
 
     def ttf_mode(self, mode_key) -> str:
         mode = self.p[mode_key].get()
@@ -339,8 +342,8 @@ class App:
                                T('Оберіть шрифт TTF / OTF, з якого брати літери.', 'Choose the TTF / OTF font to take the letters from.'))
         return False
 
-    def preview_slot(self, parent, key, title):
-        parent['children'].append({'type': 'preview', 'key': key, 'title': title,
+    def preview_slot(self, parent, key, title, col=2, note=None):
+        parent['children'].append({'type': 'preview', 'key': key, 'title': title, 'col': col, 'note': note,
                                    'hint': T('Зображення зібрано з уже запакованого атласу — так гліфи бачить гра.',
                                              'Rendered from the already packed atlas — this is what the game sees.'),
                                    'empty': T('Прев’ю з’явиться після створення шрифту.',
@@ -354,6 +357,7 @@ class App:
         """Everything the page needs to draw itself in the current language."""
         return {
             'version': VERSION, 'lang': i18n.LANG, 'languages': i18n.LANGUAGES,
+            'window': {'w': WINDOW_SIZE[0], 'h': WINDOW_SIZE[1]},
             'games': {game: {'name': name, 'full': full} for game, (name, full, *_rest) in GAMES.items()},
             'nav': [{'key': 'home', 'label': T('Огляд', 'Overview'), 'icon': 'scroll'},
                     {'section': T('Місії', 'Missions')},
@@ -402,7 +406,7 @@ class App:
 
     def _page_s1(self):
         page = self._page('s1', 'STORM 1', T('Тексти, Telop, текстури та шрифт першої гри', 'Text, Telop, textures and font of the first game'), 's1')
-        texts, tex, font = self._tabs(page, [T('Тексти', 'Text'), T('Текстури', 'Textures'), T('Шрифт', 'Font')])
+        texts, tex, font, atlas = self._tabs(page, [T('Тексти', 'Text'), T('Текстури', 'Textures'), T('Шрифт', 'Font'), T('Атлас', 'Atlas')])
         c = self.card(texts, T('Сувій перекладу', 'Translation scroll'), T('Діалоги, інтерфейс і Telop в одному TXT.', 'Dialogue, interface and Telop in one TXT.'))
         self.path(c, T('Папка перекладу', 'Translation folder'), 'workspace')
         self.actions(c, [(T('Експорт TXT', 'Export TXT'), self.s1_export, 'soft'), (T('Перевірити', 'Verify'), self.s1_verify, 'soft'),
@@ -431,30 +435,33 @@ class App:
         self.path(c, T('Папка adv_title', 'adv_title folder'), 'adv_title_scan_root')
         self.actions(c, [(T('Експортувати PNG', 'Export PNG'), lambda: self.tex_export('adv_title_scan_root', 'texture_workspace'), 'soft'),
                          (T('Зібрати змінені PNG', 'Build changed PNGs'), lambda: self.tex_build('adv_title_scan_root', 'texture_workspace', 'output'), 'primary')])
-        c = self.card(tex, T('Окремий XFBIN', 'Single XFBIN'), T('Розмір PNG під час редагування не змінюйте.', 'Do not change the PNG size while editing.'))
+        c = self.card(tex, T('Окремий XFBIN', 'Single XFBIN'), T('Розмір PNG під час редагування не змінюйте.', 'Do not change the PNG size while editing.'), col=2)
         self.path(c, T('Вихідний XFBIN', 'Source XFBIN'), 'texture_source', 'xfbin')
         self.path(c, T('Шлях у data_win32', 'Path inside data_win32'), 'texture_rel', 'text')
         self.actions(c, [(T('Експортувати PNG', 'Export PNG'), self.tex_one_export, 'soft'), (T('Перевірити', 'Verify'), self.tex_one_inspect, 'soft'),
                          (T('Зібрати PNG', 'Build PNG'), self.tex_one_build, 'primary')])
 
         c = self.card(font, T('Техніка письма', 'Lettering technique'),
-                      T('Українські літери з TTF / OTF. Оригінальні гліфи зберігаються; нові додаються в окремі рядки атласу з проміжками.', 'Ukrainian letters from a TTF / OTF. Original glyphs are kept; new ones go into separate atlas rows with gaps between cells.'))
+                      T('Оригінальні гліфи зберігаються; нові додаються в окремі рядки атласу з проміжками.', 'Original glyphs are kept; new ones go into separate atlas rows with gaps between cells.'))
         self.path(c, T('Оригінальний шрифт гри', 'Original game font'), 'font_source', 'xfbin')
         self.ttf(c, 'ttf_source', 'ttf_mode_s1')
         self.path(c, T('Шлях у data_win32', 'Path inside data_win32'), 'font_rel', 'text')
         self.chars(c, 's1_chars')
         self.actions(c, [(T('Створити шрифт', 'Create font'), self.s1_font_make, 'primary'),
                          (T('Відкрити прев’ю', 'Open preview'), lambda: self.open_preview('s1'), 'ghost')])
-        m = self.more(c, T('Печаті техніки', 'Glyph options'))
-        self.check(m, T('Мала «р» — форма оригінальної латинської p', 'Lowercase «р» — shape of the original Latin p'), 's1_p')
-        self.check(m, T('Мала «у» — форма оригінальної латинської y', 'Lowercase «у» — shape of the original Latin y'), 's1_y')
-        self.check(m, T('Метрики за найближчою латинською літерою (інакше — базові A / a)', 'Metrics from the closest Latin letter (otherwise the basic A / a)'), 's1_native_metrics')
-        self.note(c, T('Після пакування атлас зчитується назад: якщо біля комірки є сторонні пікселі, шрифт не буде записано.', 'After packing, the atlas is read back: if stray pixels sit next to a cell, the font is not written.'))
-        self.preview_slot(font, 's1', T('Як це виглядає у грі', 'How it looks in the game'))
-        c = self.card(font, T('Атлас PNG + таблиця Unicode', 'PNG atlas + Unicode table'), T('Ручне редагування: гліфи білі з прозорістю, розмір не змінювати.', 'Manual editing: white glyphs with transparency, keep the size.'))
+        self.preview_slot(font, 's1', T('Як це виглядає у грі', 'How it looks in the game'),
+                          note=T('Після пакування атлас зчитується назад: якщо біля комірки є сторонні пікселі, шрифт не буде записано.',
+                                 'After packing, the atlas is read back: if stray pixels sit next to a cell, the font is not written.'))
+        c = self.card(font, T('Печаті техніки', 'Glyph options'), col=2)
+        self.check(c, T('Мала «р» — форма оригінальної латинської p', 'Lowercase «р» — shape of the original Latin p'), 's1_p')
+        self.check(c, T('Мала «у» — форма оригінальної латинської y', 'Lowercase «у» — shape of the original Latin y'), 's1_y')
+        self.check(c, T('Метрики за найближчою латинською літерою (інакше — базові A / a)', 'Metrics from the closest Latin letter (otherwise the basic A / a)'), 's1_native_metrics')
+        c = self.card(atlas, T('Атлас PNG + таблиця Unicode', 'PNG atlas + Unicode table'), T('Ручне редагування: гліфи білі з прозорістю, розмір не змінювати.', 'Manual editing: white glyphs with transparency, keep the size.'))
+        self.path(c, T('Оригінальний шрифт гри', 'Original game font'), 'font_source', 'xfbin')
         self.path(c, T('Робоча папка шрифту', 'Font workspace folder'), 'font_workspace')
-        self.actions(c, [(T('Аналізувати', 'Analyze'), self.s1_font_inspect, 'soft'), (T('Експортувати PNG + TSV', 'Export PNG + TSV'), self.s1_font_export, 'soft'),
-                         (T('Зібрати зі змінених файлів', 'Build from edited files'), self.s1_font_build, 'soft')])
+        self.path(c, T('Шлях у data_win32', 'Path inside data_win32'), 'font_rel', 'text')
+        self.actions(c, [(T('Аналіз', 'Analyze'), self.s1_font_inspect, 'soft'), (T('Експорт PNG + TSV', 'Export PNG + TSV'), self.s1_font_export, 'soft'),
+                         (T('Зібрати змінені файли', 'Build from edited files'), self.s1_font_build, 'soft')])
 
     def _page_s2(self):
         page = self._page('s2', 'STORM 2', T('messageInfo, текстури та шрифт другої гри', 'messageInfo, textures and font of the second game'), 's2')
@@ -474,7 +481,7 @@ class App:
         self.path(c, T('Робочі PNG', 'Working PNGs'), 'storm2_texture_workspace')
         self.path(c, T('Папка Build', 'Build folder'), 'storm2_output')
         for title, key in ((T('Інтерфейс (ui)', 'Interface (ui)'), 'storm2_ui_root'), (T('Сюжетні титри (pt)', 'Story titles (pt)'), 'storm2_pt_root')):
-            c = self.card(tex, title)
+            c = self.card(tex, title, col=2)
             self.path(c, T('Оригінальні ресурси', 'Original resources'), key)
             self.actions(c, [(T('Експортувати PNG', 'Export PNG'), lambda k=key: self.tex_export(k, 'storm2_texture_workspace'), 'soft'),
                              (T('Зібрати змінені PNG', 'Build changed PNGs'), lambda k=key: self.tex_build(k, 'storm2_texture_workspace', 'storm2_output'), 'primary')])
@@ -488,12 +495,12 @@ class App:
         self.actions(c, [(T('Створити шрифт', 'Create font'), self.s2_font_make, 'primary'),
                          (T('Відкрити прев’ю', 'Open preview'), lambda: self.open_preview('s2'), 'ghost')])
         self.preview_slot(font, 's2', T('Додані гліфи', 'Added glyphs'))
-        c = self.card(font, T('Ремонт раніше зібраного шрифту', 'Repair a previously built font'), T('Темні літери, апостроф і висота Ґ/ґ — без TTF.', 'Dark letters, apostrophe and Ґ/ґ height — no TTF needed.'))
+        c = self.card(font, T('Ремонт раніше зібраного шрифту', 'Repair a previously built font'), T('Темні літери, апостроф і висота Ґ/ґ — без TTF.', 'Dark letters, apostrophe and Ґ/ґ height — no TTF needed.'), col=2)
         self.path(c, T('Зібраний XFBIN', 'Built XFBIN'), 'storm2_font_repair_source', 'xfbin')
         self.actions(c, [(T('Виправити', 'Repair'), self.s2_font_repair, 'soft')])
         c = self.card(font, T('Атлас PNG + таблиця Unicode', 'PNG atlas + Unicode table'))
-        self.actions(c, [(T('Аналізувати', 'Analyze'), self.s2_font_inspect, 'soft'), (T('Експортувати PNG + TSV', 'Export PNG + TSV'), self.s2_font_export, 'soft'),
-                         (T('Зібрати зі змінених файлів', 'Build from edited files'), self.s2_font_build, 'soft')], pady=(0, 0))
+        self.actions(c, [(T('Аналіз', 'Analyze'), self.s2_font_inspect, 'soft'), (T('Експорт PNG + TSV', 'Export PNG + TSV'), self.s2_font_export, 'soft'),
+                         (T('Зібрати змінені файли', 'Build from edited files'), self.s2_font_build, 'soft')], pady=(0, 0))
 
     def _page_s3(self):
         page = self._page('s3', 'STORM 3', T('Full Burst + HD: один TXT, три окремі XFBIN', 'Full Burst + HD: one TXT, three separate XFBIN files'), 's3')
@@ -507,7 +514,7 @@ class App:
                          (T('Відкотити встановлення', 'Roll back install'), self.s3_restore, 'ghost')])
         self.actions(c, [(T('Перевірити теги', 'Check tags'), lambda: self.check_tags('s3'), 'ghost'),
                          (T('Резервна копія TXT', 'Back up TXT'), lambda: self.backup('s3'), 'ghost')])
-        c = self.card(texts, T('Джерела', 'Sources'), T('Кожна редакція має власний формат записів — файли не взаємозамінні.', 'Each edition has its own record format — the files are not interchangeable.'))
+        c = self.card(texts, T('Джерела', 'Sources'), T('Кожна редакція має власний формат записів — файли не взаємозамінні.', 'Each edition has its own record format — the files are not interchangeable.'), col=2)
         self.path(c, T('Папка гри', 'Game folder'), 'storm3_game')
         self.path(c, 'Full Burst · WIN32', 'storm3_eng', 'xfbin')
         self.path(c, 'HD · WIN32', 'storm3_hd1', 'xfbin')
@@ -1334,6 +1341,24 @@ def find_browser():
     return next((path for path in candidates if path.is_file()), None)
 
 
+def reset_window_placement(profile: Path) -> None:
+    """Make the browser forget a resized or maximized window; where it stood is kept."""
+    prefs = profile / 'Default' / 'Preferences'
+    try:
+        data = json.loads(prefs.read_text(encoding='utf-8'))
+        changed = False
+        for place in data['browser']['app_window_placement'].values():
+            left, top = int(place['left']), int(place['top'])
+            wanted = {'right': left + WINDOW_SIZE[0], 'bottom': top + WINDOW_SIZE[1], 'maximized': False}
+            if any(place.get(key) != value for key, value in wanted.items()):
+                place.update(wanted)
+                changed = True
+        if changed:
+            atomic_write(prefs, json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass        # no saved window yet, or a layout this code does not know: the page resizes the window itself
+
+
 def open_window(url):
     """Show the page as an application window; returns the browser process or None."""
     browser = find_browser()
@@ -1342,9 +1367,9 @@ def open_window(url):
         return None
     profile = config_path().parent / 'window'
     command = [str(browser), f'--app={url}', f'--user-data-dir={profile}', '--no-first-run',
-               '--no-default-browser-check', '--disable-features=Translate,TranslateUI', '--disable-sync']
-    if not profile.exists():
-        command.append('--window-size=1280,860')       # later runs reopen where the window was left
+               '--no-default-browser-check', '--disable-features=Translate,TranslateUI', '--disable-sync',
+               '--window-size={},{}'.format(*WINDOW_SIZE)]
+    reset_window_placement(profile)
     try:
         return subprocess.Popen(command)
     except OSError:

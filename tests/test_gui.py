@@ -268,3 +268,57 @@ def test_web_files_exist_and_use_no_network():
     for name in ('index.html', 'app.css', 'app.js'):
         text = (web / name).read_text(encoding='utf-8')
         assert 'https://' not in text and 'http://' not in text, name      # the interface never goes online
+
+
+def test_the_window_has_one_fixed_size(host):
+    import natool
+    app, client = host()
+    assert client.call('/api/ui')['window'] == {'w': natool.WINDOW_SIZE[0], 'h': natool.WINDOW_SIZE[1]}
+
+
+def test_a_resized_or_maximized_window_is_forgotten(tmp_path):
+    """The browser keeps the last window; before each start its size is put back."""
+    import natool
+    prefs = tmp_path / 'Default' / 'Preferences'
+    prefs.parent.mkdir()
+    saved = {'browser': {'app_window_placement': {'_127.0.0.1_/': {
+        'left': 300, 'top': 120, 'right': 2220, 'bottom': 1160, 'maximized': True, 'work_area_left': 0}}},
+        'other': {'kept': 'as it was'}}
+    prefs.write_text(json.dumps(saved), encoding='utf-8')
+    natool.reset_window_placement(tmp_path)
+    data = json.loads(prefs.read_text(encoding='utf-8'))
+    place = data['browser']['app_window_placement']['_127.0.0.1_/']
+    width, height = natool.WINDOW_SIZE
+    assert (place['left'], place['top']) == (300, 120)                       # where it stood is kept
+    assert (place['right'], place['bottom'], place['maximized']) == (300 + width, 120 + height, False)
+    assert place['work_area_left'] == 0 and data['other'] == {'kept': 'as it was'}
+
+    before = prefs.read_bytes()
+    natool.reset_window_placement(tmp_path)                                   # nothing to change: not rewritten
+    assert prefs.read_bytes() == before
+
+    for broken in ('not json', '{"browser": 5}', '{"browser": {"app_window_placement": {"x": {"left": "?"}}}}'):
+        prefs.write_text(broken, encoding='utf-8')
+        natool.reset_window_placement(tmp_path)                               # unknown layout: left alone
+        assert prefs.read_text(encoding='utf-8') == broken
+    natool.reset_window_placement(tmp_path / 'no such profile')
+
+
+def test_the_window_always_opens_at_the_fixed_size(tmp_path, monkeypatch):
+    import natool
+    started = []
+    monkeypatch.setattr(natool, 'find_browser', lambda: Path('browser.exe'))
+    monkeypatch.setattr(natool, 'config_path', lambda: tmp_path / 'settings.json')
+    monkeypatch.setattr(natool.subprocess, 'Popen', lambda command: started.append(command) or 'process')
+    (tmp_path / 'window').mkdir()                                             # not the first start
+    assert natool.open_window('http://127.0.0.1:1/?t=x') == 'process'
+    assert '--window-size={},{}'.format(*natool.WINDOW_SIZE) in started[0]
+
+
+def test_every_tab_keeps_to_two_columns(host):
+    """Cards carry the column they belong to; the page lays a tab out from that."""
+    app, client = host()
+    pages = client.call('/api/ui')['pages']
+    tabs = [tab for page in pages for node in page['children'] if node['type'] == 'tabs' for tab in node['tabs']]
+    assert tabs and all(child.get('col', 1) in (1, 2) for tab in tabs for child in tab['children'])
+    assert [tab['title'] for page in pages if page['key'] == 's1' for node in page['children'] for tab in node['tabs']][-1] in ('Атлас', 'Atlas')

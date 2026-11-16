@@ -7,7 +7,7 @@
 Translate the text, redraw the textures and extend the fonts of STORM 1, STORM 2 and STORM 3 —
 from one window, without touching the original game files.
 
-![Version](https://img.shields.io/badge/version-5.0.0-FF7B00?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-5.0.1-FF7B00?style=for-the-badge)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge)
@@ -58,8 +58,10 @@ files a translator can actually edit, and packs the edited files back.
    fills in the paths. You can also set the folders by hand.
 6. Open a mission and press **Export TXT**.
 
-The tool opens in its own window, drawn by Microsoft Edge (part of Windows 10 and 11). Without Edge or
-Chrome it opens as a tab in your browser. It works offline and talks only to itself on `127.0.0.1`.
+The tool opens in its own window, drawn by Microsoft Edge (part of Windows 10 and 11). The window has
+one fixed size and every page fits it without scrolling; on a small screen the interface is scaled
+down as a whole. Without Edge or Chrome the tool opens as a tab in your browser. It works offline and
+talks only to itself on `127.0.0.1`.
 
 ## 📝 Translating text
 
@@ -77,6 +79,9 @@ Each game gets a single file in your workspace folder — `STORM1.ALL.UA.txt`, `
 - Leave a record empty to keep the English original.
 - Don't change headers or their order, and don't edit the manifest.
 - A line that starts with `#` or `\` is written as `\#` or `\\`.
+- Write a line break any way you like: press Enter or type `\n`. It is packed in the form the original
+  string uses (`\r\n`, `\n` or `\r`, real or written out with a backslash), and a translation may have
+  more or fewer breaks than the original. Tags in `<...>` must stay as they are.
 
 | Button | What happens |
 | --- | --- |
@@ -120,6 +125,8 @@ font — the original glyphs and their metrics are left alone.
   quotes and other signs with one click. Only characters missing from the game font are created.
 - **A preview of the result** (STORM 1). Sample text is drawn from the already packed atlas, each
   glyph placed by its own record — the way the game will show it.
+- **Manual editing** (STORM 1 and 2). The atlas can be exported as PNG with a Unicode table, edited
+  by hand and built back — the Atlas tab in STORM 1, the Font tab in STORM 2.
 
 | Game | How the letters are added |
 | --- | --- |

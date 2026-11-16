@@ -16,7 +16,7 @@ import zipfile
 from collections import defaultdict
 
 from xfbin import parse_xfbin, FormatError
-from txtfmt import atomic_write, parse_txt, export_line, escape_header_source, normalize_txt_file
+from txtfmt import atomic_write, parse_txt, export_line, escape_header_source, fit_line_breaks, normalize_txt_file
 from storm3_font import generate_font_output
 from i18n import T
 
@@ -38,7 +38,6 @@ DEFAULT_WORKSPACE = r'E:\Localization\Naruto\Storm3\UA_Workspace'
 DEFAULT_BUILD = r'E:\Localization\Naruto\Storm3\Build'
 HEADER_MAGIC = b'\xe9\x03\x00\x00'
 TAG_RE = re.compile(r'<[^<>\r\n]{1,300}>')
-MACRO_RE = re.compile(r'\\(?:r\\n|n|r|t)')
 MAX_STRING = 256 * 1024
 
 
@@ -181,6 +180,7 @@ def ensure_same(doc: Document, manifest: dict) -> None:
 def validate_translation(field: Field, translation: str) -> bytes:
     if not isinstance(translation,str):
         raise Storm3Error(T(f'{field.key}: переклад має бути рядком.', f'{field.key}: the translation must be a string.'))
+    translation=fit_line_breaks(translation,field.source)
     if not translation or translation==field.source:
         return field.source.encode('utf-8')
     if field.source.startswith('**No Translation (') and field.source.endswith(')**'):
@@ -191,12 +191,6 @@ def validate_translation(field: Field, translation: str) -> bytes:
         raise Storm3Error(T(f'{field.key}: текст завеликий.', f'{field.key}: the text is too long.'))
     if TAG_RE.findall(field.source)!=TAG_RE.findall(translation):
         raise Storm3Error(T(f'{field.key}: змінено теги <...> або їхній порядок.', f'{field.key}: the <...> tags or their order were changed.'))
-    if MACRO_RE.findall(field.source)!=MACRO_RE.findall(translation):
-        raise Storm3Error(T(f'{field.key}: змінено текстові escape-послідовності.', f'{field.key}: the text escape sequences were changed.'))
-    src_breaks=re.findall(r'\r\n|\r|\n',field.source)
-    new_breaks=re.findall(r'\r\n|\r|\n',translation)
-    if new_breaks != src_breaks:
-        raise Storm3Error(T(f'{field.key}: потрібно зберегти всі вихідні переноси рядків.', f'{field.key}: all original line breaks must be kept.'))
     return translation.encode('utf-8')
 
 
@@ -647,7 +641,8 @@ def export_project(paths, project_dir, *, log=None):
     lines=['#! STORM 3 Full Burst + HD (WIN32 / WIN64) · єдиний переклад',
            '#! Відредагуйте лише тіло після ### N і перед завершальним ###.',
            '#! Не редагуйте заголовки, EN, ідентифікатори та службові символи.',
-           '#! Теги <...>, текстові \\n і фізичні переноси рядків зберігайте.',
+           '#! Теги <...> зберігайте.',
+           '#! Перенос рядка — новий рядок або \\n: у гру він запишеться так, як в оригіналі.',
            '#! Порожнє поле перекладу = залишити оригінальний текст у відповідній редакції.',
            '#! Однакові англійські репліки різних мовців/контекстів НЕ об’єднано без підтвердження.']
     for row in rows:
@@ -703,7 +698,7 @@ def _build_one(doc:UDoc,bds,translated):
         field=fields[(bd['record'],bd['slot'])]
         if field.hash_hex!=bd['hash'] or field.source!=bd['original_source']:
             raise UnifiedError(T(doc.label+': маніфест поля змінився: '+field.key, doc.label+': the field manifest has changed: '+field.key))
-        tr=translated.get(bd['number'],'')
+        tr=fit_line_breaks(translated.get(bd['number'],''),field.source)
         payload=validate_translation(field,tr)
         if not tr or tr==field.source:continue
         target=len(data)
@@ -733,7 +728,8 @@ def _verify_one(doc:UDoc,payload:bytes,bds,translated):
         again=read_source(doc.label,tmp)
         if len(again.fields)!=len(doc.fields) or again.count!=doc.count:
             raise UnifiedError(T(doc.label+': після збирання змінилася кількість записів.', doc.label+': the number of records changed after the build.'))
-        expected={(bd['record'],bd['slot']):translated.get(bd['number']) or bd['original_source'] for bd in bds}
+        fitted={(bd['record'],bd['slot']):fit_line_breaks(translated.get(bd['number'],''),bd['original_source']) for bd in bds}
+        expected={(bd['record'],bd['slot']):fitted[(bd['record'],bd['slot'])] or bd['original_source'] for bd in bds}
         for before,after in zip(doc.fields,again.fields):
             k=(before.index,before.slot)
             if after.source!=expected[k] or (before.hash_hex,before.metadata)!=(after.hash_hex,after.metadata):
@@ -745,7 +741,7 @@ def _verify_one(doc:UDoc,payload:bytes,bds,translated):
         mutable=set(range(4))
         by_id={(f.index,f.slot):f for f in doc.fields}
         for bd in bds:
-            if translated.get(bd['number']) and translated[bd['number']]!=bd['original_source']:
+            if fitted[(bd['record'],bd['slot'])] and fitted[(bd['record'],bd['slot'])]!=bd['original_source']:
                 fld=by_id[(bd['record'],bd['slot'])]
                 mutable.update(range(fld.ptr_at,fld.ptr_at+doc.width))
         if any(p not in mutable and old!=new for p,(old,new) in enumerate(zip(before_bin,after_bin))):

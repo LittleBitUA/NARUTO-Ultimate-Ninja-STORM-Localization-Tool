@@ -15,7 +15,7 @@ import tempfile
 import zipfile
 
 from xfbin import parse_xfbin, FormatError
-from txtfmt import atomic_write, parse_txt, export_line, escape_header_source, normalize_txt_file
+from txtfmt import atomic_write, parse_txt, export_line, escape_header_source, fit_line_breaks, normalize_txt_file
 from i18n import T
 
 
@@ -36,7 +36,6 @@ DEFAULT_WORKSPACE = r'E:\Localization\Naruto\Storm2\UA_Workspace'
 DEFAULT_BUILD = r'E:\Localization\Naruto\Storm2\Build'
 HEADER_MAGIC = b'\xe9\x03\x00\x00'
 TAG_RE = re.compile(r'<[^<>\r\n]{1,300}>')
-MACRO_RE = re.compile(r'\\(?:r\\n|n|r|t)')
 MAX_STRING = 256 * 1024
 
 
@@ -200,7 +199,8 @@ def export_project(eng_path: Path | str, project_dir: Path | str, *, log=None) -
         '#! Редагуйте тільки текст МІЖ заголовком ### N та завершальним ###.',
         '#! Заголовки й порядок не змінювати. Кожне F1/F2 перекладається окремо.',
         '#! Порожнє поле перекладу означає «залишити англійською».',
-        '#! Переноси та теги <...> з оригіналу повинні залишитися незмінними.',
+        '#! Теги <...> з оригіналу повинні залишитися незмінними.',
+        '#! Перенос рядка — новий рядок або \\n: у гру він запишеться так, як в оригіналі.',
         '#! Рядок перед ### — роздільник; внутрішні порожні рядки дозволені.',
         r'#! Для буквальних початкових # або \ використовуйте \# та \\.',
     ]
@@ -228,6 +228,7 @@ def export_project(eng_path: Path | str, project_dir: Path | str, *, log=None) -
 def validate_translation(field: Field, translation: str) -> bytes:
     if not isinstance(translation,str):
         raise Storm2Error(T(f'{field.key}: переклад має бути рядком.', f'{field.key}: the translation must be a text string.'))
+    translation=fit_line_breaks(translation,field.source)
     if not translation or translation==field.source:
         return field.source.encode('utf-8')
     if field.source.startswith('**No Translation (') and field.source.endswith(')**'):
@@ -238,12 +239,6 @@ def validate_translation(field: Field, translation: str) -> bytes:
         raise Storm2Error(T(f'{field.key}: текст завеликий.', f'{field.key}: the text is too large.'))
     if TAG_RE.findall(field.source)!=TAG_RE.findall(translation):
         raise Storm2Error(T(f'{field.key}: змінено теги <...> або їхній порядок.', f'{field.key}: the <...> tags or their order were changed.'))
-    if MACRO_RE.findall(field.source)!=MACRO_RE.findall(translation):
-        raise Storm2Error(T(f'{field.key}: змінено текстові escape-послідовності.', f'{field.key}: the text escape sequences were changed.'))
-    src_breaks=re.findall(r'\r\n|\r|\n',field.source)
-    new_breaks=re.findall(r'\r\n|\r|\n',translation)
-    if new_breaks != src_breaks:
-        raise Storm2Error(T(f'{field.key}: потрібно зберегти всі вихідні переноси рядків.', f'{field.key}: all line breaks of the original must be kept.'))
     return translation.encode('utf-8')
 
 
@@ -258,6 +253,8 @@ def _load_project(eng_path: Path|str, project_dir: Path|str) -> tuple[Document,d
         raise Storm2Error(T(f'Немає TXT: {project_dir/TXT_NAME}', f'TXT not found: {project_dir/TXT_NAME}'))
     try:translations=parse_txt(project_dir/TXT_NAME,manifest)
     except Exception as exc:raise Storm2Error(T(f'Пошкоджено формат TXT: {exc}', f'The TXT format is damaged: {exc}')) from exc
+    sources={f.number:f.source for f in doc.fields}
+    translations={n:fit_line_breaks(v,sources[n]) if n in sources else v for n,v in translations.items()}
     return doc,translations
 
 
@@ -267,7 +264,7 @@ def build_bytes(doc: Document, translations:dict[int,str]) -> tuple[bytes,dict]:
     b = bytearray(doc.original[doc.binary_offset:doc.binary_offset+doc.binary_size])
     edited={}
     for field in doc.fields:
-        tr=translations.get(field.number,'')
+        tr=fit_line_breaks(translations.get(field.number,''),field.source)
         payload=validate_translation(field,tr)
         if not tr or tr==field.source:continue
         if field.pointer_offset in edited:

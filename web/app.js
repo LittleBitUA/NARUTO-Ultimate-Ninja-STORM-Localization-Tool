@@ -26,6 +26,47 @@ const tabChoice = {};     // page key -> selected tab index
 const dialogs = [];       // queued notices
 let dialogOpen = false;
 
+// ---- one fixed window size --------------------------------------------------
+// The program window always has the same size, and every page is laid out to fit
+// the area below without scrolling. Where the screen is too small for that window
+// (a laptop, or Windows scaling above 100 %), the interface is scaled down as a
+// whole, so nothing is ever cut off.
+const DESIGN = { w: 1320, h: 800 };       // the smallest page area in which everything fits
+let fitScale = 1;
+
+function fit() {
+  const app = $('app');
+  fitScale = Math.min(1, innerWidth / DESIGN.w, innerHeight / DESIGN.h);
+  document.documentElement.style.setProperty('--fit', fitScale);
+  app.style.transform = fitScale < 1 ? `scale(${fitScale})` : '';
+  app.style.width = fitScale < 1 ? innerWidth / fitScale + 'px' : '';
+  app.style.height = fitScale < 1 ? innerHeight / fitScale + 'px' : '';
+}
+
+let snapTimer = 0, snappedAt = -1e9;
+function snapWindow() {
+  if (!ui) return;
+  const WINDOW = ui.window;                // outer size of the program window, set by the host
+  const area = { x: screen.availLeft || 0, y: screen.availTop || 0, w: screen.availWidth, h: screen.availHeight };
+  if (outerWidth >= area.w && outerHeight >= area.h) return;         // maximized: leave it to the user
+  const w = Math.min(WINDOW.w, area.w), h = Math.min(WINDOW.h, area.h);
+  if (Math.abs(outerWidth - w) < 2 && Math.abs(outerHeight - h) < 2) return;
+  if (performance.now() - snappedAt < 1500) return;                  // the browser refused: do not fight it
+  snappedAt = performance.now();
+  try {
+    resizeTo(w, h);                                                  // ignored in an ordinary browser tab
+    const x = Math.max(area.x, Math.min(screenX, area.x + area.w - w));
+    const y = Math.max(area.y, Math.min(screenY, area.y + area.h - h));
+    if (x !== screenX || y !== screenY) moveTo(x, y);                // keep the whole window on the screen
+  } catch (error) { /* nothing to do */ }
+}
+addEventListener('resize', () => { fit(); clearTimeout(snapTimer); snapTimer = setTimeout(snapWindow, 200); });
+// Browser zoom would change the size of everything inside the fixed window.
+addEventListener('wheel', event => { if (event.ctrlKey) event.preventDefault(); }, { passive: false });
+addEventListener('keydown', event => {
+  if ((event.ctrlKey || event.metaKey) && ['+', '-', '=', '0'].includes(event.key)) event.preventDefault();
+});
+
 // ---- talking to the host ---------------------------------------------------
 async function api(path, body) {
   const options = { headers: { 'X-Token': TOKEN } };
@@ -130,8 +171,8 @@ function openMenu(event, key, input) {
     item(ui.strings.clear, () => { input.value = ''; setPath(key, '', true); }, !!value),
     item(ui.strings.openFolder, () => api('/api/folder', { key }), !!value));
   menu.hidden = false;
-  const x = Math.min(event.clientX, innerWidth - menu.offsetWidth - 8);
-  const y = Math.min(event.clientY, innerHeight - menu.offsetHeight - 8);
+  const x = Math.min(event.clientX, innerWidth - menu.offsetWidth * fitScale - 8);
+  const y = Math.min(event.clientY, innerHeight - menu.offsetHeight * fitScale - 8);
   menu.style.left = x + 'px'; menu.style.top = y + 'px';
 }
 document.addEventListener('click', event => { if (!$('menu').contains(event.target)) $('menu').hidden = true; });
@@ -189,7 +230,8 @@ const renderers = {
     const ownRow = el('label', { class: 'choice' }, own, el('span', {}, node.own));
     const input = pathInput(node, 'ttf'); input.placeholder = node.placeholder;
     const error = el('span', { class: 'field-error', hidden: true }, ui.strings.missing);
-    const line = el('div', { class: 'inline' }, input, browseButton(node.key, 'ttf'));
+    const line = el('div', { class: 'inline' }, el('div', { class: 'field-box' }, input, error), browseButton(node.key, 'ttf'));
+    const hint = el('p', { class: 'note' }, node.hint);
     binders.push(s => {
       const mode = s.ttf[node.mode];
       bundled.checked = mode === 'bundled'; own.checked = mode === 'own';
@@ -197,15 +239,16 @@ const renderers = {
       bundledRow.className = 'choice' + (mode === 'bundled' ? ' on' : '') + (s.bundled ? '' : ' off');
       ownRow.className = 'choice' + (mode === 'own' ? ' on' : '');
       line.hidden = mode !== 'own';
+      hint.hidden = s.bundled;                       // only needed when the bundled font is missing
       const bad = s.bad.includes(node.key);
       input.classList.toggle('bad', bad); error.hidden = !bad || mode !== 'own';
     });
     return el('fieldset', { class: 'group' }, el('legend', {}, node.label),
-      bundledRow, ownRow, line, error, el('p', { class: 'note' }, node.hint));
+      el('div', { class: 'choices' }, bundledRow, ownRow), line, hint);
   },
   chars(node) {
     const id = 'f' + (++uid);
-    const area = el('textarea', { id, class: 'input', rows: '3', spellcheck: 'false',
+    const area = el('textarea', { id, class: 'input', rows: '2', spellcheck: 'false',
       oninput: () => { setPath(node.key, area.value); count(); } });
     const counter = el('span', {});
     const plural = n => {
@@ -221,7 +264,7 @@ const renderers = {
       el('div', { class: 'chars-head' }, el('label', { for: id }, node.label), counter),
       area,
       el('div', { class: 'actions' },
-        node.sets.map((set, index) => el('button', { type: 'button', class: 'btn chip' + (index ? '' : ' lead'),
+        node.sets.map((set, index) => el('button', { type: 'button', class: 'btn chip' + (index ? '' : ' lead'), title: set.title,
           onclick: () => put(unique(area.value + set.add).join('')) }, set.label)),
         el('button', { type: 'button', class: 'btn chip', onclick: () => put('') }, node.clear)),
       el('p', { class: 'note' }, node.hint));
@@ -243,7 +286,8 @@ const renderers = {
         el('div', { class: 'seal kanji', 'aria-hidden': 'true' }, '済')),
       box,
       el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn ghost',
-        onclick: () => act(node.key, { path: '/api/preview/open', body: { key: node.key } }) }, ui.strings.openImage)));
+        onclick: () => act(node.key, { path: '/api/preview/open', body: { key: node.key } }) }, ui.strings.openImage)),
+      node.note && el('p', { class: 'sub' }, node.note));
   },
   tabs(node, owner) {
     const buttons = [], panels = [];
@@ -254,7 +298,12 @@ const renderers = {
     };
     node.tabs.forEach((tab, index) => {
       buttons.push(el('button', { type: 'button', class: 'tab', role: 'tab', onclick: () => choose(index) }, tab.title));
-      panels.push(el('div', { class: 'tab-panel', role: 'tabpanel' }, renderAll(tab.children)));
+      const right = tab.children.filter(child => child.col === 2);
+      panels.push(right.length
+        ? el('div', { class: 'tab-panel two', role: 'tabpanel' },
+            el('div', { class: 'col' }, renderAll(tab.children.filter(child => child.col !== 2))),
+            el('div', { class: 'col' }, renderAll(right)))
+        : el('div', { class: 'tab-panel', role: 'tabpanel' }, renderAll(tab.children)));
     });
     choose(Math.min(tabChoice[owner] || 0, buttons.length - 1));
     return [el('div', { class: 'tabs', role: 'tablist' }, buttons), ...panels];
@@ -468,6 +517,7 @@ addEventListener('pagehide', () => {
     page = state.page || 'home';
     const query = new URLSearchParams(location.search);      // ?tab=N&log=1 open a given view directly
     if (query.has('tab')) for (const p of ui.pages) tabChoice[p.key] = Number(query.get('tab')) || 0;
+    fit(); snapWindow();
     build();
     if (query.get('log') === '1') toggleLog();
     logEpoch = -1; logCursor = 0;          // the first paint already consumed nothing: read the log from the start

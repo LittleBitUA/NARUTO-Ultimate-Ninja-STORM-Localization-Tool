@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from xfbin import parse_xfbin, FormatError
-from txtfmt import TxtError as PipelineError, atomic_write, escape_header_source, export_line, parse_txt, normalize_txt_file
+from txtfmt import TxtError as PipelineError, atomic_write, escape_header_source, export_line, fit_line_breaks, parse_txt, normalize_txt_file
 from i18n import T
 
 
@@ -53,8 +53,6 @@ LITERAL_HEADING_TRANSLATIONS = {
     '<Flashback Mission Icons>': '<Позначки місій-спогадів>',
     '<Icon Types>': '<Типи позначок>',
 }
-
-MACRO_RE = re.compile(r'\\r\\n|\\n|\\r|\\t')
 
 class MessageError(ValueError):
     pass
@@ -226,16 +224,10 @@ def load_messages(path: Path | str, *, allow_unverified: bool = False) -> Messag
                       container.chunks,tables,entries,schema)
 
 
-def normalized(value: str, source: str) -> str:
-    if '\r\n' in source and '\n' not in source.replace('\r\n',''):
-        value=value.replace('\r\n','\n').replace('\n','\r\n')
-    return value
-
-
 def validate_value(entry: Entry, value: str) -> bytes:
     if not isinstance(value,str):raise MessageError(T(f'{entry.key}: текст має бути рядком.', f'{entry.key}: the text must be a string.'))
     if not value:value=entry.source
-    value=normalized(value,entry.source)
+    value=fit_line_breaks(value,entry.source)
     if '\0' in value or any(ord(ch)<32 and ch not in '\t\r\n' for ch in value):
         raise MessageError(T(f'{entry.key}: неприпустимий керувальний символ.', f'{entry.key}: invalid control character.'))
     original_tags = TAG_RE.findall(entry.source)
@@ -243,8 +235,6 @@ def validate_value(entry: Entry, value: str) -> bytes:
     allowable_localized = [LITERAL_HEADING_TRANSLATIONS.get(t, t) for t in original_tags]
     if translated_tags != original_tags and translated_tags != allowable_localized:
         raise MessageError(T(f'{entry.key}: змінено ігрові теги або невідомий заголовок у <...>.', f'{entry.key}: game tags were changed, or there is an unknown heading in <...>.'))
-    if MACRO_RE.findall(entry.source)!=MACRO_RE.findall(value):
-        raise MessageError(T(f'{entry.key}: змінено буквальні \\n / \\r\\n тощо.', f'{entry.key}: literal \\n / \\r\\n etc. were changed.'))
     enc=value.encode('utf-8','strict')
     if len(enc)>MAX_STRING:raise MessageError(T(f'{entry.key}: текст завеликий.', f'{entry.key}: the text is too large.'))
     return enc
@@ -596,13 +586,6 @@ def load_missioninfo(path: str | Path) -> MissionInfo:
                        raw[binary_offset + binary_size:], fields, gaps, schema)
 
 
-def _normalize_newlines(translation: str, source: str) -> str:
-    # Preserve native line-ending convention if a text editor converted CRLF to LF.
-    if '\r\n' in source and '\n' not in source.replace('\r\n', '') and '\r' not in source.replace('\r\n', ''):
-        return translation.replace('\r\n', '\n').replace('\n', '\r\n')
-    return translation
-
-
 def validated_text(item: Field, translation: str) -> bytes:
     if item.is_id:
         if translation and translation != item.source:
@@ -611,7 +594,7 @@ def validated_text(item: Field, translation: str) -> bytes:
     elif not translation:
         translation = item.source
     else:
-        translation = _normalize_newlines(translation, item.source)
+        translation = fit_line_breaks(translation, item.source)
     if '\0' in translation or any(ord(c) < 32 and c not in '\r\n\t' for c in translation):
         raise MissionInfoError(T(f'{item.key}: у тексті є неприпустимі керувальні символи.', f'{item.key}: the text contains invalid control characters.'))
     try:
@@ -780,7 +763,6 @@ TELOP_FILES = ('movieTelopBin.xfbin','dioramaTelopBin.xfbin',
              'iaTelopBin.xfbin','spSkillTelopBin.xfbin')
 TELOP_MAX_TEXT_BYTES = 128 * 1024
 TELOP_TAG_RE = re.compile(r'<[^<>\r\n]{1,200}>')
-ESC_RE = re.compile(r'\\r\\n|\\n|\\r')
 
 
 class TelopError(ValueError):
@@ -901,13 +883,8 @@ def validate_telop_value(entry: TelopEntry, text: str):
     b = text.encode('utf-8', 'strict')
     if len(b) > TELOP_MAX_TEXT_BYTES:
         raise TelopError(T(f'{entry.key}: текст довший за {TELOP_MAX_TEXT_BYTES} байтів.', f'{entry.key}: the text is longer than {TELOP_MAX_TEXT_BYTES} bytes.'))
-    source = entry.source
-    if (source.count('\r\n'), source.count('\n'), source.count('\r')) != (text.count('\r\n'), text.count('\n'), text.count('\r')):
-        raise TelopError(T(f'{entry.key}: змінено кількість або стиль фізичних переносів рядків.', f'{entry.key}: the number or style of physical line breaks was changed.'))
-    if TELOP_TAG_RE.findall(source) != TELOP_TAG_RE.findall(text):
+    if TELOP_TAG_RE.findall(entry.source) != TELOP_TAG_RE.findall(text):
         raise TelopError(T(f'{entry.key}: змінено форматувальні теги.', f'{entry.key}: formatting tags were changed.'))
-    if ESC_RE.findall(source) != ESC_RE.findall(text):
-        raise TelopError(T(f'{entry.key}: змінено буквальні \\n / \\r\\n.', f'{entry.key}: literal \\n / \\r\\n were changed.'))
 
 
 def build_telop(doc: TelopDoc) -> bytes:
@@ -915,6 +892,7 @@ def build_telop(doc: TelopDoc) -> bytes:
     extra = set(doc.translations) - set(known)
     if extra:
         raise TelopError(T(f'Переклад містить сторонні ключі: {sorted(extra)[:3]}', f'The translation contains unknown keys: {sorted(extra)[:3]}'))
+    doc.translations = {key: fit_line_breaks(value, known[key].source) for key, value in doc.translations.items()}
     for key, value in doc.translations.items():
         validate_telop_value(known[key], value)
     by_chunk = {}
@@ -1282,7 +1260,7 @@ def export_project(eng_dir: Path|str, output_dir: Path|str, *,
         '#! Порожній рядок перед ### — роздільник; внутрішні порожні рядки дозволено.',
         r'#! Рядок, що починається з # або \, екрануйте як \# або \\.',
         '#! Порожній переклад означає «залишити англійський оригінал».',
-        '#! UTF-8 BOM / CRLF; внутрішні перенесення зберігаються.',
+        '#! UTF-8 BOM / CRLF. Перенос рядка — новий рядок або \\n: у гру він запишеться так, як в оригіналі.',
     ]
     last_virt = None
     for r in rows:
@@ -1513,6 +1491,7 @@ def build_project(eng_dir:Path|str, project_dir:Path|str, output_root:Path|str, 
         selected={key:value for (name,key),value in index.items() if name==rel}
         if f['filename'] in TELOP_FILES:
             valid={e.key:e for e in doc.entries}
+            selected={key:fit_line_breaks(value,valid[key].source) for key,value in selected.items()}
             for key,value in selected.items():
                 validate_telop_value(valid[key],value)
             doc.translations=selected
